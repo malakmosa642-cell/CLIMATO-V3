@@ -1,13 +1,30 @@
 import { ReactNode } from 'react';
-import { BarChart3, BellRing, Briefcase, FileSpreadsheet, Code2, CreditCard, Microscope, BookOpen } from 'lucide-react';
+import {
+  BarChart3,
+  BellRing,
+  BookOpen,
+  Briefcase,
+  Code2,
+  CreditCard,
+  FileSpreadsheet,
+  KeyRound,
+  LogOut,
+  Microscope,
+  ShieldCheck,
+} from 'lucide-react';
 import { Language, PageRoute } from '../types/climate';
 import { UI_COPY } from '../data/bilingualContent';
+import type { AuthOrgSummary, AuthUserSummary } from './AuthModal';
 
 interface DashboardShellProps {
   lang: Language;
   route: PageRoute;
   onNavigate: (route: PageRoute) => void;
   breadcrumb: string;
+  authUser?: AuthUserSummary | null;
+  authOrg?: AuthOrgSummary | null;
+  onOpenAuth?: () => void;
+  onLogout?: () => void;
   children: ReactNode;
 }
 
@@ -16,6 +33,10 @@ export default function DashboardShell({
   route,
   onNavigate,
   breadcrumb,
+  authUser,
+  authOrg,
+  onOpenAuth,
+  onLogout,
   children,
 }: DashboardShellProps) {
   const isAr = lang === 'ar';
@@ -65,7 +86,37 @@ export default function DashboardShell({
           <div className="text-xs text-slate-400 font-medium">
             {UI_COPY.brand[lang]} / <span className="text-slate-200">{breadcrumb}</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {authUser ? (
+              <div className="flex items-center gap-2 px-2.5 py-1 rounded-lg border border-emerald-900/80 bg-[#030A05] text-[11px]">
+                <ShieldCheck className="w-3.5 h-3.5 text-[#22FF3A] shrink-0" />
+                <span className="text-slate-200 font-medium truncate max-w-[180px]">
+                  {authOrg?.name || authUser.fullName}
+                </span>
+                <span className="font-mono text-[#22FF3A]">{authUser.role}</span>
+                {onLogout && (
+                  <button
+                    type="button"
+                    onClick={onLogout}
+                    title={isAr ? 'تسجيل الخروج' : 'Sign Out'}
+                    className="ms-1 text-slate-400 hover:text-rose-300 cursor-pointer"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            ) : (
+              onOpenAuth && (
+                <button
+                  type="button"
+                  onClick={onOpenAuth}
+                  className="px-3 py-1.5 rounded-lg border border-[#22FF3A]/40 bg-[#22FF3A]/10 text-xs font-semibold text-[#22FF3A] hover:bg-[#22FF3A]/20 inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+                >
+                  <KeyRound className="w-3.5 h-3.5" />
+                  <span>{isAr ? 'تسجيل الدخول / إنشاء مؤسسة' : 'Sign In / Register'}</span>
+                </button>
+              )
+            )}
             <button
               type="button"
               onClick={() => onNavigate('reports')}

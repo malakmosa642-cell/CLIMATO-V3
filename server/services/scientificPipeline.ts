@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { db, recordAuditLog } from '../db/database.ts';
+import { db, recordAuditLog, withTransaction } from '../db/database.ts';
 import {
   DEFAULT_STUDY_REGIONS,
   SCIENTIFIC_DATASETS,
@@ -50,6 +50,7 @@ export interface ScientificPipelineExecutionResult {
   dataset: ScientificDatasetSpec;
   region: StudyRegionSpec;
   provenanceType: ProvenanceMode | 'PENDING_CONFIGURATION';
+  blockerCode?: 'BLOCKED_BY_CREDENTIALS' | null;
   isRealObservation: boolean;
   status: 'COMPLETED' | 'PENDING_CONFIGURATION' | 'INSUFFICIENT_DATA';
   temporalAggregation: TemporalAggregationMode;
@@ -60,6 +61,7 @@ export interface ScientificPipelineExecutionResult {
   configurationSteps: string[];
   spatialAssessment: SpatialFootprintAssessment;
   stages: PipelineStageResult[];
+  provenanceChecksum?: string | null;
   series: Array<{
     obsDate: string;
     year: number;
@@ -186,20 +188,16 @@ function normalizeUnitValue(
   if (rawValue === null || !Number.isFinite(rawValue)) return null;
 
   if (dataset.id === 'merra-2') {
-    // MERRA-2 native T2M is Kelvin (~280-320K); if user CSV already exported °C (<120), keep °C
     const celsius = !alreadyNormalizedHint && rawValue > 150 ? rawValue - 273.15 : rawValue;
     return Number(celsius.toFixed(3));
   }
   if (dataset.id === 'gpm-imerg') {
-    // GPM IMERG native is mm/hr; monthly conversion multiplies by 24 * daysInMonth
     const mmMonth = !alreadyNormalizedHint ? rawValue * 24 * daysInMonth(year, month) : rawValue;
     return Number(mmMonth.toFixed(3));
   }
   if (dataset.id === 'gldas') {
-    // GLDAS SoilMoi0_10cm_inst is kg/m² (= mm water depth in 0-10cm); keep native physical unit
     return Number(rawValue.toFixed(3));
   }
-  // GRACE-FO lwe_thickness is cm
   return Number(rawValue.toFixed(3));
 }
 
@@ -229,11 +227,6 @@ function buildExpectedMonthGrid(startDate: string, endDate: string): Array<{ yea
   return grid;
 }
 
-/**
- * Deterministic methodological validation fixture ONLY for testing statistical pipelines
- * when NASA Earthdata credentials / uploaded Giovanni CSVs are not yet supplied.
- * Explicitly tagged `METHODOLOGICAL_TEST_FIXTURE` and `isRealObservation: false`.
- */
 function buildMethodologicalTestFixture(
   dataset: ScientificDatasetSpec,
   region: StudyRegionSpec,
@@ -248,9 +241,8 @@ function buildMethodologicalTestFixture(
     const tYr = idx / 12;
     const phase = ((m.month - 1) / 12) * Math.PI * 2;
     let rawValue: number | null = null;
-    let qualityFlag = 'TEST_FIXTURE_SYNTHETIC_BENCHMARK';
+    const qualityFlag = 'TEST_FIXTURE_SYNTHETIC_BENCHMARK';
 
-    // Preserve realistic GRACE/GRACE-FO 2017-07 .. 2018-05 inter-mission gap for realistic missing-data diagnostics
     if (
       dataset.id === 'grace-fo' &&
       ((m.year === 2017 && m.month >= 7) || (m.year === 2018 && m.month <= 5))
@@ -267,27 +259,23 @@ function buildMethodologicalTestFixture(
     }
 
     if (dataset.id === 'merra-2') {
-      // Kelvin (normalized to °C): ~21.5°C base + seasonal cycle + ~0.04°C/yr benchmark drift
       const baseC = [20.9, 22.1, 24.0][regionHash];
       const amp = [5.8, 7.2, 8.6][regionHash];
       const trend = [0.036, 0.048, 0.041][regionHash];
       const valC = baseC - amp * Math.cos(phase) + trend * tYr + Math.sin(idx * 1.7) * 0.35;
       rawValue = Number((valC + 273.15).toFixed(2));
     } else if (dataset.id === 'gpm-imerg') {
-      // mm/hr raw rate -> normalized mm/month
       const winterWeight = Math.max(0, Math.cos(phase));
       const baseMmMonth = [14.5, 2.8, 0.6][regionHash] * Math.pow(winterWeight, 1.8);
       const valMmMonth = Math.max(0, baseMmMonth + (idx % 5 === 0 ? 1.2 : 0));
       rawValue = Number((valMmMonth / (24 * daysInMonth(m.year, m.month))).toFixed(5));
     } else if (dataset.id === 'gldas') {
-      // kg/m² (0-10cm)
       const baseSm = [23.8, 13.4, 17.6][regionHash];
       const trend = [-0.09, -0.05, -0.06][regionHash];
       rawValue = Number(
         Math.max(4, baseSm + 2.4 * Math.cos(phase) + trend * tYr + Math.cos(idx * 1.3) * 0.45).toFixed(2)
       );
     } else {
-      // GRACE-FO cm LWE (Cairo & Delta share ~300km basin signature)
       const baseTws = [1.2, 1.0, -0.4][regionHash];
       const trend = [-0.32, -0.30, -0.44][regionHash];
       rawValue = Number((baseTws + 2.1 * Math.sin(phase) + trend * tYr + Math.sin(idx * 1.1) * 0.3).toFixed(2));
@@ -346,7 +334,6 @@ function aggregateTemporally(
       }));
   }
 
-  // Seasonal (DJF=1, MAM=4, JJA=7, SON=10)
   const buckets = new Map<string, { year: number; month: number; vals: number[] }>();
   for (const p of points) {
     if (p.normalizedValue === null) continue;
@@ -380,6 +367,7 @@ export async function runScientificPipeline(params: {
   importedAlreadyNormalized?: boolean;
   importedSourceLabel?: string;
   requestId?: string;
+  persist?: boolean;
 }): Promise<ScientificPipelineExecutionResult> {
   const dataset = SCIENTIFIC_DATASETS.find((d) => d.id === params.datasetId);
   if (!dataset) {
@@ -395,6 +383,7 @@ export async function runScientificPipeline(params: {
   const endDate = params.endDate || '2024-12-31';
   const temporalAggregation: TemporalAggregationMode = params.temporalAggregation || 'monthly';
   const requestedMode: ProvenanceMode = params.mode || 'LIVE_NASA_EARTHDATA';
+  const shouldPersist = params.persist !== false;
 
   const queryHash = crypto
     .createHash('sha256')
@@ -408,7 +397,7 @@ export async function runScientificPipeline(params: {
         temporalAggregation,
         mode: requestedMode,
         importHash: params.importedRawText
-          ? crypto.createHash('sha1').update(params.importedRawText).digest('hex')
+          ? crypto.createHash('sha256').update(params.importedRawText).digest('hex')
           : null,
       })
     )
@@ -421,29 +410,32 @@ export async function runScientificPipeline(params: {
 
   let acquiredRecords: RawAcquiredRecord[] = [];
   let effectiveProvenance: ProvenanceMode | 'PENDING_CONFIGURATION' = requestedMode;
+  let blockerCode: 'BLOCKED_BY_CREDENTIALS' | null = null;
   let cmrDiscovery: CmrDiscoveryResult | null = null;
   let opendapRequestTemplate = `https://cmr.earthdata.nasa.gov/search/granules.json?short_name=${dataset.cmrShortName}`;
   let configurationSteps: string[] = [];
+  let provenanceChecksum: string | null = null;
+  let ingestSource: string = requestedMode;
   let message = '';
 
-  // STAGE 1: ACQUISITION
   if (requestedMode === 'IMPORTED_OBSERVATIONS' && params.importedRawText) {
     acquiredRecords = parseImportedObservationSeries({
       rawText: params.importedRawText,
       format: params.importedFormat,
       sourceLabel: params.importedSourceLabel,
     });
+    provenanceChecksum = crypto.createHash('sha256').update(params.importedRawText).digest('hex');
+    ingestSource = params.importedSourceLabel || 'NASA_GIOVANNI_EXPORT';
     stages.push({
       stage: '1. Data Acquisition',
       status: 'COMPLETED',
-      summary: `Parsed ${acquiredRecords.length} imported observation rows from ${
-        params.importedSourceLabel || 'NASA Giovanni / AppEEARS CSV'
-      }.`,
-      metrics: { rawRows: acquiredRecords.length },
+      summary: `Parsed ${acquiredRecords.length} imported observation rows from ${ingestSource}.`,
+      metrics: { rawRows: acquiredRecords.length, sha256: provenanceChecksum.slice(0, 12) },
     });
     message = `Processed ${acquiredRecords.length} imported observations for ${region.nameEn} (${dataset.productId}).`;
   } else if (requestedMode === 'METHODOLOGICAL_TEST_FIXTURE') {
     acquiredRecords = buildMethodologicalTestFixture(dataset, region, startDate, endDate);
+    ingestSource = 'METHODOLOGICAL_TEST_FIXTURE';
     stages.push({
       stage: '1. Data Acquisition',
       status: 'WARNING',
@@ -463,6 +455,9 @@ export async function runScientificPipeline(params: {
     opendapRequestTemplate = connectorRes.opendapRequestTemplate;
     configurationSteps = connectorRes.configurationSteps;
     acquiredRecords = connectorRes.records;
+    provenanceChecksum = connectorRes.provenanceChecksum ?? null;
+    blockerCode = connectorRes.blockerCode ?? null;
+    ingestSource = 'NASA_EARTHDATA_DIRECT';
     message = connectorRes.message;
 
     if (connectorRes.status !== 'CONNECTED_LIVE' || acquiredRecords.length === 0) {
@@ -475,6 +470,7 @@ export async function runScientificPipeline(params: {
           cmrReachable: cmrDiscovery?.liveReachable ?? false,
           cmrGranuleHits: cmrDiscovery?.granuleHits ?? 0,
           earthdataTokenConfigured: connectorRes.earthdataTokenConfigured,
+          blockerCode: connectorRes.blockerCode ?? null,
         },
       });
     } else {
@@ -482,34 +478,43 @@ export async function runScientificPipeline(params: {
         stage: '1. Data Acquisition',
         status: 'COMPLETED',
         summary: connectorRes.message,
-        metrics: { rawRows: acquiredRecords.length },
+        metrics: {
+          rawRows: acquiredRecords.length,
+          downloadedGranules: connectorRes.downloadedGranulesCount ?? 0,
+          provenanceChecksum: provenanceChecksum?.slice(0, 12) ?? null,
+        },
       });
     }
   }
 
-  // If acquisition returned no series (PENDING_CONFIGURATION), persist run honestly and return immediately
   if (acquiredRecords.length === 0) {
-    const nowIso = new Date().toISOString();
-    db.prepare(`
-      INSERT INTO pipeline_runs (
-        id, dataset_id, region_id, start_date, end_date, temporal_aggregation,
-        provenance_type, status, query_hash, records_ingested, valid_records,
-        missing_periods, stage_report_json, diagnostics_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
-    `).run(
-      runId,
-      dataset.id,
-      region.id,
-      startDate,
-      endDate,
-      temporalAggregation,
-      'PENDING_CONFIGURATION',
-      'PENDING_CONFIGURATION',
-      queryHash,
-      JSON.stringify(stages),
-      JSON.stringify({ cmrDiscovery, spatialAssessment, opendapRequestTemplate }),
-      nowIso
-    );
+    if (shouldPersist) {
+      const nowIso = new Date().toISOString();
+      withTransaction(() => {
+        db.prepare(`
+          INSERT INTO pipeline_runs (
+            id, dataset_id, region_id, start_date, end_date, temporal_aggregation,
+            provenance_type, status, query_hash, records_ingested, valid_records,
+            missing_periods, stage_report_json, diagnostics_json, provenance_checksum, ingest_source, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?)
+        `).run(
+          runId,
+          dataset.id,
+          region.id,
+          startDate,
+          endDate,
+          temporalAggregation,
+          'PENDING_CONFIGURATION',
+          'PENDING_CONFIGURATION',
+          queryHash,
+          JSON.stringify(stages),
+          JSON.stringify({ cmrDiscovery, spatialAssessment, opendapRequestTemplate, blockerCode }),
+          provenanceChecksum,
+          ingestSource,
+          nowIso
+        );
+      });
+    }
 
     return {
       runId,
@@ -518,6 +523,7 @@ export async function runScientificPipeline(params: {
       dataset,
       region,
       provenanceType: 'PENDING_CONFIGURATION',
+      blockerCode,
       isRealObservation: false,
       status: 'PENDING_CONFIGURATION',
       temporalAggregation,
@@ -528,13 +534,13 @@ export async function runScientificPipeline(params: {
       configurationSteps,
       spatialAssessment,
       stages,
+      provenanceChecksum,
       series: [],
       trendReport: null,
       message,
     };
   }
 
-  // STAGE 2: VALIDATION (Date range filter & deduplication)
   const filteredByDate = acquiredRecords
     .filter((r) => r.obsDate >= startDate.slice(0, 7) + '-01' && r.obsDate <= endDate.slice(0, 7) + '-01')
     .sort((a, b) => a.obsDate.localeCompare(b.obsDate));
@@ -549,7 +555,6 @@ export async function runScientificPipeline(params: {
     metrics: { validatedMonths: byMonthMap.size },
   });
 
-  // STAGE 3 & 4: QUALITY FILTERING & MISSING-DATA HANDLING (Zero silent imputation)
   const expectedMonths = buildExpectedMonthGrid(startDate, endDate);
   let validCount = 0;
   let missingCount = 0;
@@ -574,7 +579,6 @@ export async function runScientificPipeline(params: {
     }
 
     validCount += 1;
-    // STAGE 7 (applied per valid datum): UNIT NORMALIZATION
     const normalizedValue = normalizeUnitValue(
       dataset,
       rec.rawValue,
@@ -615,7 +619,6 @@ export async function runScientificPipeline(params: {
     },
   });
 
-  // STAGE 5: SPATIAL AGGREGATION & RESOLUTION PRESERVATION
   stages.push({
     stage: '5. Spatial Aggregation',
     status: spatialAssessment.footprintExceedsRegion ? 'WARNING' : 'COMPLETED',
@@ -629,7 +632,6 @@ export async function runScientificPipeline(params: {
     },
   });
 
-  // STAGE 6: TEMPORAL AGGREGATION
   const aggregatedSeries = aggregateTemporally(fullMonthlySeries, temporalAggregation);
   stages.push({
     stage: '6. Temporal Aggregation',
@@ -638,7 +640,6 @@ export async function runScientificPipeline(params: {
     metrics: { cadence: temporalAggregation, steps: aggregatedSeries.length },
   });
 
-  // STAGE 7: UNIT NORMALIZATION REPORT
   stages.push({
     stage: '7. Unit Normalization',
     status: 'COMPLETED',
@@ -646,7 +647,6 @@ export async function runScientificPipeline(params: {
     metrics: { rawUnit: dataset.nativeUnit, normalizedUnit: dataset.normalizedUnit },
   });
 
-  // Run Statistical Trend Engine
   const trendReport = analyzeTimeSeriesTrends(aggregatedSeries, dataset.normalizedUnit, {
     expectedSteps: temporalAggregation === 'monthly' ? expectedMonths.length : aggregatedSeries.length,
   });
@@ -654,112 +654,134 @@ export async function runScientificPipeline(params: {
   const finalStatus: ScientificPipelineExecutionResult['status'] =
     trendReport.status === 'INSUFFICIENT_DATA' ? 'INSUFFICIENT_DATA' : 'COMPLETED';
 
-  // STAGE 8: PROVENANCE PERSISTENCE (SQLite)
-  const nowIso = new Date().toISOString();
-  db.prepare(`
-    INSERT INTO pipeline_runs (
-      id, dataset_id, region_id, start_date, end_date, temporal_aggregation,
-      provenance_type, status, query_hash, records_ingested, valid_records,
-      missing_periods, stage_report_json, diagnostics_json, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    runId,
-    dataset.id,
-    region.id,
-    startDate,
-    endDate,
-    temporalAggregation,
-    effectiveProvenance,
-    finalStatus,
-    queryHash,
-    fullMonthlySeries.length,
-    validCount,
-    missingCount,
-    JSON.stringify(stages),
-    JSON.stringify({
-      trendStatus: trendReport.status,
-      coveragePct: trendReport.diagnostics.coveragePct,
-      spatialAssessment,
-    }),
-    nowIso
-  );
+  if (shouldPersist) {
+    const nowIso = new Date().toISOString();
+    withTransaction(() => {
+      db.prepare(`
+        INSERT INTO pipeline_runs (
+          id, dataset_id, region_id, start_date, end_date, temporal_aggregation,
+          provenance_type, status, query_hash, records_ingested, valid_records,
+          missing_periods, stage_report_json, diagnostics_json, provenance_checksum, ingest_source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId,
+        dataset.id,
+        region.id,
+        startDate,
+        endDate,
+        temporalAggregation,
+        effectiveProvenance,
+        finalStatus,
+        queryHash,
+        fullMonthlySeries.length,
+        validCount,
+        missingCount,
+        JSON.stringify(stages),
+        JSON.stringify({
+          trendStatus: trendReport.status,
+          coveragePct: trendReport.diagnostics.coveragePct,
+          spatialAssessment,
+        }),
+        provenanceChecksum,
+        ingestSource,
+        nowIso
+      );
 
-  const insertObs = db.prepare(`
-    INSERT INTO scientific_observations (
-      run_id, region_id, dataset_id, variable_key, obs_date, year, month,
-      raw_value, raw_unit, normalized_value, normalized_unit, uncertainty,
-      quality_flag, is_missing, native_spatial_resolution, provenance_type,
-      source_granule_ref, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+      // Incremental upsert by deleting overlapping observations for the same region, dataset, date range, and provenance
+      db.prepare(`
+        DELETE FROM scientific_observations
+        WHERE region_id = ? AND dataset_id = ? AND provenance_type = ? AND obs_date >= ? AND obs_date <= ?
+      `).run(
+        region.id,
+        dataset.id,
+        effectiveProvenance,
+        `${startDate.slice(0, 7)}-01`,
+        `${endDate.slice(0, 7)}-01`
+      );
 
-  for (const pt of fullMonthlySeries) {
-    insertObs.run(
-      runId,
-      region.id,
-      dataset.id,
-      dataset.variableKey,
-      pt.obsDate,
-      pt.year,
-      pt.month,
-      pt.rawValue,
-      pt.rawUnit,
-      pt.normalizedValue,
-      pt.normalizedUnit,
-      pt.uncertainty,
-      pt.qualityFlag,
-      pt.isMissing ? 1 : 0,
-      dataset.spatialResolution,
-      effectiveProvenance,
-      pt.sourceGranuleRef,
-      nowIso
-    );
+      const insertObs = db.prepare(`
+        INSERT INTO scientific_observations (
+          run_id, region_id, dataset_id, variable_key, obs_date, year, month,
+          raw_value, raw_unit, normalized_value, normalized_unit, uncertainty,
+          quality_flag, is_missing, native_spatial_resolution, provenance_type,
+          source_granule_ref, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const pt of fullMonthlySeries) {
+        insertObs.run(
+          runId,
+          region.id,
+          dataset.id,
+          dataset.variableKey,
+          pt.obsDate,
+          pt.year,
+          pt.month,
+          pt.rawValue,
+          pt.rawUnit,
+          pt.normalizedValue,
+          pt.normalizedUnit,
+          pt.uncertainty,
+          pt.qualityFlag,
+          pt.isMissing ? 1 : 0,
+          dataset.spatialResolution,
+          effectiveProvenance,
+          pt.sourceGranuleRef,
+          nowIso
+        );
+      }
+
+      const payloadForCache = {
+        runId,
+        queryHash,
+        trendReport,
+        spatialAssessment,
+        series: fullMonthlySeries,
+      };
+      db.prepare(`
+        INSERT INTO trend_analysis_cache (query_hash, dataset_id, region_id, provenance_type, result_json, computed_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(query_hash) DO UPDATE SET
+          provenance_type = excluded.provenance_type,
+          result_json = excluded.result_json,
+          computed_at = excluded.computed_at
+      `).run(queryHash, dataset.id, region.id, effectiveProvenance, JSON.stringify(payloadForCache), nowIso);
+    });
+
+    stages.push({
+      stage: '8. Provenance & Persistence',
+      status: 'COMPLETED',
+      summary: `Stored run ${runId} and ${fullMonthlySeries.length} records in SQLite transaction with provenance '${effectiveProvenance}'.`,
+    });
+
+    stages.push({
+      stage: '9. Caching & Reproducibility',
+      status: 'COMPLETED',
+      summary: `Indexed deterministic reproducibility hash ${queryHash}.`,
+      metrics: { queryHash },
+    });
+
+    recordAuditLog({
+      requestId: params.requestId || 'science-pipeline',
+      actor: 'trend-detective-pipeline',
+      action: 'SCIENTIFIC_PIPELINE_RUN',
+      resourceType: 'pipeline_run',
+      resourceId: runId,
+      metadata: {
+        datasetId: dataset.id,
+        regionId: region.id,
+        provenanceType: effectiveProvenance,
+        trendStatus: trendReport.status,
+        queryHash,
+      },
+    });
+  } else {
+    stages.push({
+      stage: '8. Provenance & Persistence',
+      status: 'WARNING',
+      summary: 'Read-only preview comparison (unauthenticated GET); database writes require authenticated researcher session.',
+    });
   }
-
-  stages.push({
-    stage: '8. Provenance & Persistence',
-    status: 'COMPLETED',
-    summary: `Stored run ${runId} and ${fullMonthlySeries.length} records in SQLite with provenance '${effectiveProvenance}'.`,
-  });
-
-  // STAGE 9: CACHING & REPRODUCIBILITY
-  const payloadForCache = {
-    runId,
-    queryHash,
-    trendReport,
-    spatialAssessment,
-    series: fullMonthlySeries,
-  };
-  db.prepare(`
-    INSERT INTO trend_analysis_cache (query_hash, dataset_id, region_id, provenance_type, result_json, computed_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(query_hash) DO UPDATE SET
-      provenance_type = excluded.provenance_type,
-      result_json = excluded.result_json,
-      computed_at = excluded.computed_at
-  `).run(queryHash, dataset.id, region.id, effectiveProvenance, JSON.stringify(payloadForCache), nowIso);
-
-  stages.push({
-    stage: '9. Caching & Reproducibility',
-    status: 'COMPLETED',
-    summary: `Indexed deterministic reproducibility hash ${queryHash}.`,
-    metrics: { queryHash },
-  });
-
-  recordAuditLog({
-    requestId: params.requestId || 'science-pipeline',
-    actor: 'trend-detective-pipeline',
-    action: 'SCIENTIFIC_PIPELINE_RUN',
-    resourceType: 'pipeline_run',
-    resourceId: runId,
-    metadata: {
-      datasetId: dataset.id,
-      regionId: region.id,
-      provenanceType: effectiveProvenance,
-      trendStatus: trendReport.status,
-      queryHash,
-    },
-  });
 
   return {
     runId,
@@ -768,6 +790,7 @@ export async function runScientificPipeline(params: {
     dataset,
     region,
     provenanceType: effectiveProvenance,
+    blockerCode,
     isRealObservation: effectiveProvenance === 'LIVE_NASA_EARTHDATA' || effectiveProvenance === 'IMPORTED_OBSERVATIONS',
     status: finalStatus,
     temporalAggregation,
@@ -778,6 +801,7 @@ export async function runScientificPipeline(params: {
     configurationSteps,
     spatialAssessment,
     stages,
+    provenanceChecksum,
     series: fullMonthlySeries,
     trendReport,
     message,
@@ -791,6 +815,7 @@ export async function compareAllRegionsForDataset(params: {
   temporalAggregation?: TemporalAggregationMode;
   mode?: ProvenanceMode;
   requestId?: string;
+  persist?: boolean;
 }) {
   const regions = listStudyRegionsFromDb();
   const regionResults = await Promise.all(
@@ -803,11 +828,11 @@ export async function compareAllRegionsForDataset(params: {
         temporalAggregation: params.temporalAggregation,
         mode: params.mode,
         requestId: params.requestId,
+        persist: params.persist,
       })
     )
   );
 
-  // Also check if there are any previously imported real observations stored per region in SQLite
   const storedSummary = regions.map((r) => {
     const row = db
       .prepare(

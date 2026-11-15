@@ -3,6 +3,7 @@ import { Globe2, Map, Search } from 'lucide-react';
 import DashboardShell from '../components/DashboardShell';
 import EarthGlobe3D from '../components/EarthGlobe3D';
 import SampleDataBanner from '../components/SampleDataBanner';
+import type { AuthOrgSummary, AuthUserSummary } from '../components/AuthModal';
 import { ModuleExposureRadar, TimeSeriesChart } from '../components/TelemetryCharts';
 import { MODULES } from '../data/bilingualContent';
 import {
@@ -23,6 +24,10 @@ interface DashboardViewProps {
   onSelectModule: (id: ModuleId | 'all') => void;
   onSelectAoi: (id: string) => void;
   onNavigate: (route: PageRoute) => void;
+  authUser?: AuthUserSummary | null;
+  authOrg?: AuthOrgSummary | null;
+  onOpenAuth?: () => void;
+  onLogout?: () => void;
 }
 
 export default function DashboardView({
@@ -34,6 +39,10 @@ export default function DashboardView({
   onSelectModule,
   onSelectAoi,
   onNavigate,
+  authUser,
+  authOrg,
+  onOpenAuth,
+  onLogout,
 }: DashboardViewProps) {
   const isAr = lang === 'ar';
   const [observations, setObservations] = useState<SampleObservation[]>([]);
@@ -51,7 +60,7 @@ export default function DashboardView({
     if (selectedModuleId !== 'all') params.set('moduleId', selectedModuleId);
     if (selectedAoiId !== 'all') params.set('aoiId', selectedAoiId);
 
-    fetch(`/api/observations?${params.toString()}`)
+    fetch(`/api/observations?${params.toString()}`, { credentials: 'include' })
       .then((res) => {
         if (!res.ok) throw new Error('Failed to load sample observations');
         return res.json();
@@ -100,6 +109,10 @@ export default function DashboardView({
       route="dashboard"
       onNavigate={onNavigate}
       breadcrumb={isAr ? 'لوحة التحليلات الجيومكانية (بيانات نموذجية)' : 'Geospatial Analytics Console (Sample Mode)'}
+      authUser={authUser}
+      authOrg={authOrg}
+      onOpenAuth={onOpenAuth}
+      onLogout={onLogout}
     >
       <SampleDataBanner lang={lang} />
 

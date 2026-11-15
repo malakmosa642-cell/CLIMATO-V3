@@ -2,86 +2,67 @@
 
 ## 1. Threat Model & Trust Boundaries
 
-CLIMATO separates traffic across three API surfaces in `server/app.ts`:
+CLIMATO separates traffic across four mounted Express route groups in `server/app.ts`:
 
-1. **`/api/v1/*` (`v1Router`)** — Versioned, multi-tenant external REST API. Protected by Bearer API key authentication, SHA-256 token hashing, scope-based authorization, sliding-window per-key rate limiting, and strict workspace tenant isolation.
-2. **`/api/science/*` (`scienceRouter`)** — Scientific Trend Detective pipeline endpoints (Egypt study region configuration, NASA CMR collection discovery, Giovanni/AppEEARS CSV/JSON ingestion, and Mann-Kendall/Theil-Sen execution).
-3. **`/api/*` (`platformRouter`)** — First-party UI console endpoints. Sensitive administrative read endpoints (`GET /api/audit-logs`, `GET /api/demo-requests`) are gated behind `requireKeyManagementAuth`.
-
----
-
-## 2. Authentication & API Key Lifecycle
-
-### 2.1 Fail-Closed Bearer Authentication (`v1AuthAndRateLimit`)
-- **Public exception**: Only `GET /api/v1/health` is unauthenticated.
-- **Key management exception**: `/api/v1/keys*` delegates to `requireKeyManagementAuth`.
-- **All other `/api/v1/*` routes** require `Authorization: Bearer <API_KEY>`:
-  - Missing header → `401 MISSING_AUTH_TOKEN`
-  - Malformed header → `401 INVALID_AUTH_HEADER`
-  - Unknown or revoked key → `401 INVALID_OR_REVOKED_API_KEY`
-
-### 2.2 At-Rest Token Hashing & Single-Display Provisioning
-- Raw API tokens (`clm_sbx_<32-hex>`) are generated via `crypto.randomBytes(16)` and returned **once** on `POST /api/v1/keys`.
-- SQLite `api_keys` stores **only** the SHA-256 digest (`token_hash`) and a masked display prefix (`token_prefix`, e.g., `clm_sbx_****e0b7`).
-- Legacy migration `002_api_key_hashing_and_tenant_scoping` automatically hashes and scrubs any legacy plaintext `token_value` rows.
-- `GET /api/v1/keys` returns active (`revoked_at IS NULL`) masked prefixes only.
-- `DELETE /api/v1/keys/:id` performs soft revocation by setting `revoked_at`, preserving audit history while immediately rejecting subsequent Bearer requests.
-
-### 2.3 Demo Sandbox Key Production Guardrail
-- The default evaluation key (`key-sbx-default`) is seeded **only** in non-production environments when `CLIMATO_DISABLE_DEMO_KEY !== "true"`.
-- When `NODE_ENV=production` or `CLIMATO_DISABLE_DEMO_KEY=true`, `initDatabase()` automatically marks `key-sbx-default` revoked.
+1. **`/api/auth/*` (`authRouter`)** — User registration (`POST /api/auth/register`), login (`POST /api/auth/login`), logout (`POST /api/auth/logout`), current identity (`GET /api/auth/me`), and organization/member management (`GET /api/auth/org`, `POST /api/auth/org/members`).
+2. **`/api/v1/*` (`v1Router`)** — Versioned, multi-tenant external REST API protected by Bearer API key authentication (`v1AuthAndRateLimit`), SHA-256 token hashing, scope checks (`requireScope`), sliding-window per-key rate limiting, monthly organization API quotas, and strict workspace tenant isolation.
+3. **`/api/science/*` (`scienceRouter`)** — Public catalog read endpoints (`GET /api/science/overview`, `GET /api/science/runs`, `GET /api/science/coordinate-profile`, `GET /api/science/compare`) alongside authenticated, role-gated mutation endpoints (`PUT /api/science/regions/:id`, `POST /api/science/regions/reset`, `POST /api/science/probe-sources`, `POST /api/science/pipeline/run`, `POST /api/science/import`).
+4. **`/api/*` (`platformRouter`)** — First-party console API. Public health/reference/intake endpoints (`GET /api/health`, `GET /api/weather/*`, `GET /api/connectors`, `POST /api/climate/analyze`, `POST /api/demo-requests`) coexist with strictly authenticated, tenant-isolated resource routes (`/api/workspaces`, `/api/aois`, `/api/observations`, `/api/alerts*`, `/api/webhooks*`, `/api/reports*`) and admin-restricted telemetry (`GET /api/audit-logs`, `GET /api/demo-requests`, `GET /api/admin/overview`).
 
 ---
 
-## 3. Admin Secret & Constant-Time Verification
+## 2. Security Middleware & HTTP Hardening
 
-`requireKeyManagementAuth` protects:
-- `GET /api/v1/keys`
-- `POST /api/v1/keys`
-- `DELETE /api/v1/keys/:id`
-- `GET /api/audit-logs`
-- `GET /api/demo-requests`
+Configured in `server/app.ts` and `server/middleware/requestContext.ts`:
 
-Verification rules:
-- When `CLIMATO_ADMIN_SECRET` is set, callers must provide `X-Climato-Admin-Secret`. Comparison uses `crypto.timingSafeEqual` (via `constantTimeEqual` in `server/middleware/requestContext.ts`) to mitigate timing side-channels.
-- When `NODE_ENV=production` and `CLIMATO_ADMIN_SECRET` is unset, endpoints **fail closed** with `403 KEY_MANAGEMENT_LOCKED`.
-
----
-
-## 4. Multi-Tenant Isolation & Scope Enforcement
-
-### 4.1 Workspace Binding
-- Every API key row in `api_keys` is bound to a `workspace_id` (default `ws-delta-agro`).
-- `resolveTenantWorkspaceId()` and `assertTenantRecordOwnership()` enforce tenant boundaries on `/api/v1/*`:
-  - Listing endpoints (`GET /api/v1/workspaces`, `GET /api/v1/alerts`, `GET /api/v1/reports`, `GET /api/v1/modules/:moduleId/data`) filter strictly by `workspace_id = apiKeyContext.workspaceId`.
-  - Cross-tenant query or body spoofing (`?workspaceId=ws-other` or `{ workspaceId: "ws-other" }`) is rejected with `403 TENANT_ISOLATION_VIOLATION`.
-  - Cross-tenant resource access (`POST /api/v1/alerts/:id/evaluate`, `GET /api/v1/alerts/:id/evaluations`, `GET /api/v1/reports/:id/export`, `GET /api/v1/modules/:moduleId/data?aoiId=...`) verifies ownership and returns `403 TENANT_ISOLATION_VIOLATION`.
-
-### 4.2 Scope Checks (`requireScope`)
-- `modules:read` — Read workspaces, AOIs, module records, reports, and alert evaluations
-- `connectors:read` — Read staged satellite connector registry and coordinate previews
-- `geospatial:analyze` — Execute `POST /api/v1/climate/analyze`
-- `reports:write` — Create ESG report requests
-- `alerts:write` — Create and evaluate geofence alerts
-- `audit:read` — Inspect tenant-scoped audit logs
+- **Helmet**: Sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, production `Strict-Transport-Security`, and Content-Security-Policy (`connect-src` restricted to `'self'`, Open-Meteo, and NASA CMR).
+- **Explicit CORS Policy**: Validates `Origin` against `CORS_ALLOWED_ORIGINS` and `APP_URL` (plus localhost in non-production). Disallowed origins receive structured `403 CORS_ORIGIN_FORBIDDEN`.
+- **Proxy & Body Limits**: `app.set('trust proxy', 1)`, `x-powered-by` disabled, `express.json({ limit: '2mb' })`, `express.urlencoded({ extended: false, limit: '256kb' })`.
+- **Rate Limiting & Brute-Force Lockout**:
+  - `globalApiRateLimiter`: Global IP sliding window (`240 req/min` dev, `180 req/min` prod).
+  - `authBruteForceRateLimiter`: Auth/demo-intake protection (`20 req / 15 min` outside tests).
+  - Persistent account lockout on `users`: 5 failed login attempts lock login for 15 minutes (`locked_until`, `423 ACCOUNT_LOCKED`).
+- **Error Serialization**: `errorMiddleware` suppresses stack traces and internal SQLite error details from HTTP JSON responses.
 
 ---
 
-## 5. Rate Limiting, Webhook HMAC & Input Validation
+## 3. Authentication, Sessions & Role-Based Access Control (RBAC)
 
-- **Rate Limiting**: In-memory 60-second sliding bucket keyed by API key ID (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`). Exceeding `rate_limit_rpm` returns `429 RATE_LIMIT_EXCEEDED`.
-- **Webhook Signing**: `evaluateGeofenceAlerts()` signs alert payloads with HMAC-SHA256 (`sha256=<hex>`) using `CLIMATO_WEBHOOK_SECRET`. In `NODE_ENV=production`, missing `CLIMATO_WEBHOOK_SECRET` throws an error (fail closed); in non-production, a per-process `crypto.randomBytes(32)` ephemeral secret is used (zero hardcoded secrets).
-- **Input Validation**:
-  - Strict WGS84 bounds (`lat ∈ [-90, 90]`, `lon ∈ [-180, 180]`).
-  - Egypt study-region bounds enforced on `/api/science/regions/:id` (`Lat 20..34°N`, `Lon 22..38°E`).
-  - Alert operators restricted to `>`, `>=`, `<`, `<=`.
-  - SQLite queries use parameterized prepared statements (`db.prepare(...).run/get/all`).
-  - Foreign key constraints (`PRAGMA foreign_keys = ON`) and explicit workspace existence checks prevent orphan records.
+- **Passwords**: Hashed using `crypto.scryptSync` with per-user 16-byte random salt (`scrypt$<salt>$<hash>`) and verified via `crypto.timingSafeEqual`.
+- **Sessions**: `clm_ses_<48-hex>` tokens returned on login/registration and also stored in `HttpOnly`, `SameSite=Lax` (plus `Secure` in production) cookies. Only `SHA-256(token)` is persisted in SQLite `user_sessions`.
+- **Roles (`requireRoles`)**:
+  - `platform_admin` (or verified `X-Climato-Admin-Secret`): Cross-organization administrative telemetry (`GET /api/admin/overview`), platform-wide audit logs, demo requests.
+  - `org_admin`: Organization workspace/member/API-key/webhook-secret rotation and science mutation access scoped strictly to `userContext.organizationId`.
+  - `workspace_member`: Operational mutations (`POST /api/aois`, `POST /api/alerts`, `POST /api/alerts/:id/evaluate`, `POST /api/webhooks`, `POST /api/reports`) scoped to `workspace_memberships` / organization workspaces.
+  - `authenticated_user`: Read access to authorized workspace summaries and report exports.
 
 ---
 
-## 6. Known Limitations & Hardening Roadmap
+## 4. API Key Lifecycle (`api_keys`)
 
-- **UI Platform Router (`/api/*`)**: Designed for first-party browser console usage without a separate end-user OAuth/JWT session layer; before multi-organization public SaaS deployment, place `/api/*` behind an identity provider (e.g., OIDC/JWT session middleware) or route console mutations through authenticated tenant tokens.
-- **In-Memory Rate Limiter**: Current `rateBuckets` Map is single-instance; horizontal multi-pod deployments should back rate limiting with Redis or an API gateway.
-- **SQLite Persistence**: Single-node WAL SQLite (`data/terrapulse.db`); production multi-region deployments should migrate to managed PostgreSQL/PostGIS.
+- **Generation & Hashing**: Tokens (`clm_sbx_<32-hex>`) are generated via `crypto.randomBytes(16)`, displayed **once** in `POST /api/v1/keys` and `POST /api/v1/keys/:id/rotate`, and stored solely as `token_hash` (SHA-256) + masked `token_prefix`. Legacy migration `002` hashes and scrubs any pre-existing plaintext rows.
+- **Lifecycle Controls**:
+  - Optional expiration (`expiresInDays`, persisted as `expires_at`; expired keys fail with `401 API_KEY_EXPIRED`).
+  - Atomic rotation (`POST /api/v1/keys/:id/rotate`) revokes the prior key (`revoked_at`) and records lineage (`rotated_from_id`) inside a SQLite transaction.
+  - Soft revocation (`DELETE /api/v1/keys/:id`) sets `revoked_at` and invalidates the token immediately.
+- **Production Demo Key Guardrail**: `key-sbx-default` is only seeded in non-production environments and is automatically revoked when `NODE_ENV=production` or `CLIMATO_DISABLE_DEMO_KEY=true`.
+
+---
+
+## 5. Multi-Tenant Isolation & Scope Enforcement
+
+- `assertOrganizationOwnership()`, `resolveTenantWorkspaceId()`, and `assertTenantRecordOwnership()` verify workspace & organization ownership across `/api/*` and `/api/v1/*`. Cross-tenant query spoofing or resource ID probing returns `403 TENANT_ISOLATION_VIOLATION`.
+- API keys require explicit scopes (`requireScope`) including `modules:read`, `connectors:read`, `geospatial:analyze`, `reports:write`, `alerts:write`, and `audit:read`.
+- Every `/api` and `/api/v1` call meters organization usage in `api_usage_logs` and enforces monthly `organizations.monthly_api_quota` (`429 ORG_MONTHLY_QUOTA_EXCEEDED`).
+
+---
+
+## 6. Webhook Security & SSRF Protection (`webhookService.ts`)
+
+- **Destination Validation (`assertSafeWebhookUrl`)**: Enforces `https:` outside explicit test/local opt-in, rejects `localhost`/`.local`/`.internal` hostnames, inspects literal and DNS-resolved IPv4/IPv6 addresses, and blocks loopback, RFC-1918 private networks, CGNAT/multicast, and `169.254.0.0/16` cloud metadata ranges.
+- **Encrypted Secret Storage**: Per-endpoint signing secrets (`whsec_*`) are encrypted at rest with AES-256-GCM (`encv1:<iv>:<tag>:<cipher>`) derived from `CLIMATO_WEBHOOK_SECRET` / `CLIMATO_ADMIN_SECRET`.
+- **Signed Delivery & Replay Protection**: Outbound webhook `POST` requests include:
+  - `X-Climato-Timestamp`: Unix epoch seconds
+  - `X-Climato-Signature`: `sha256=<HMAC-SHA256(secret, rawBody)>`
+  - `X-Climato-Signature-V2`: `v2=<HMAC-SHA256(secret, timestamp + "." + rawBody)>`
+- **Admin Secret Fail-Closed**: Missing `CLIMATO_ADMIN_SECRET` in `NODE_ENV=production` fails closed (`403 KEY_MANAGEMENT_LOCKED`); missing `CLIMATO_WEBHOOK_SECRET` in `NODE_ENV=production` throws cleanly.

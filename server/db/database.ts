@@ -57,11 +57,68 @@ export function initDatabase(customDbPath?: string) {
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA synchronous = NORMAL;
   `);
 
   const migrationResult = runMigrations(db);
   seedInitialData();
   return migrationResult;
+}
+
+let transactionDepth = 0;
+
+export function withTransaction<T>(fn: () => T): T {
+  const isOutermost = transactionDepth === 0;
+  transactionDepth += 1;
+  if (isOutermost) {
+    db.exec('BEGIN IMMEDIATE');
+  } else {
+    db.exec(`SAVEPOINT sp_${transactionDepth}`);
+  }
+  try {
+    const result = fn();
+    if (isOutermost) {
+      db.exec('COMMIT');
+    } else {
+      db.exec(`RELEASE SAVEPOINT sp_${transactionDepth}`);
+    }
+    return result;
+  } catch (err) {
+    if (isOutermost) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback error
+      }
+    } else {
+      try {
+        db.exec(`ROLLBACK TO SAVEPOINT sp_${transactionDepth}`);
+        db.exec(`RELEASE SAVEPOINT sp_${transactionDepth}`);
+      } catch {
+        // ignore savepoint rollback error
+      }
+    }
+    throw err;
+  } finally {
+    transactionDepth -= 1;
+  }
+}
+
+export function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `scrypt$${salt}$${derived}`;
+}
+
+export function verifyPassword(password: string, storedHash: string): boolean {
+  const parts = storedHash.split('$');
+  if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+  const [, salt, hexDigest] = parts;
+  const derived = crypto.scryptSync(password, salt, 64);
+  const expected = Buffer.from(hexDigest, 'hex');
+  if (derived.length !== expected.length) return false;
+  return crypto.timingSafeEqual(derived, expected);
 }
 
 export function recordAuditLog(params: {
@@ -89,6 +146,36 @@ export function recordAuditLog(params: {
 }
 
 function seedInitialData() {
+  const now = new Date().toISOString();
+
+  // Seed B2B tenant organizations
+  const insertOrg = db.prepare(`
+    INSERT OR IGNORE INTO organizations (id, name, slug, plan_tier, monthly_api_quota, aoi_quota, billing_status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertOrg.run('org-climato-demo', 'CLIMATO Platform Sandbox Org', 'climato-sandbox', 'Sector Pro', 50000, 25, 'SANDBOX_ACTIVE', now);
+  insertOrg.run('org-nile-agro', 'Nile Delta Agro Holdings (Sample)', 'nile-agro', 'Sector Pro', 50000, 25, 'SANDBOX_ACTIVE', now);
+  insertOrg.run('org-coastal-finance', 'Mediterranean Coastal Finance Group (Sample)', 'coastal-finance', 'Enterprise & Sovereign', 250000, 100, 'SANDBOX_ACTIVE', now);
+
+  // Optional admin user seeding via explicit server env vars (never hardcoded)
+  const seedAdminEmail = process.env.CLIMATO_SEED_ADMIN_EMAIL?.trim().toLowerCase();
+  const seedAdminPassword = process.env.CLIMATO_SEED_ADMIN_PASSWORD?.trim();
+  if (seedAdminEmail && seedAdminPassword && seedAdminPassword.length >= 10) {
+    const existingAdmin = db.prepare('SELECT id FROM users WHERE email = ?').get(seedAdminEmail);
+    if (!existingAdmin) {
+      db.prepare(`
+        INSERT INTO users (id, email, full_name, password_hash, role, organization_id, status, created_at)
+        VALUES (?, ?, ?, ?, 'platform_admin', 'org-climato-demo', 'ACTIVE', ?)
+      `).run(
+        `usr-${crypto.randomBytes(6).toString('hex')}`,
+        seedAdminEmail,
+        'CLIMATO Platform Administrator',
+        hashPassword(seedAdminPassword),
+        now
+      );
+    }
+  }
+
   const existingConnectors = db.prepare('SELECT COUNT(*) as count FROM satellite_connectors').get() as { count: number };
   if (existingConnectors.count === 0) {
     const insertConnector = db.prepare(`
@@ -120,15 +207,14 @@ function seedInitialData() {
   const existingWorkspaces = db.prepare('SELECT COUNT(*) as count FROM workspaces').get() as { count: number };
   if (existingWorkspaces.count === 0) {
     const insertWs = db.prepare(`
-      INSERT INTO workspaces (id, name_en, name_ar, sector, plan_tier, aoi_limit, owner_role_en, owner_role_ar, active_modules, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO workspaces (id, name_en, name_ar, sector, plan_tier, aoi_limit, owner_role_en, owner_role_ar, active_modules, organization_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    const now = new Date().toISOString();
-    insertWs.run('ws-delta-agro', 'Nile Delta Agro-Export Portfolio (Sample)', 'محفظة التصدير الزراعي بدلتا النيل (نموذج)', 'Agriculture & Exporting', 'Sector Pro Tier', 25, 'Agronomy & Export Risk Lead', 'مدير مخاطر الزراعة والتصدير', 'crop-health,water-monitoring,delta-risk,trend-alerts', now);
-    insertWs.run('ws-coastal-banking', 'Coastal Real Estate & Credit Risk (Sample)', 'مخاطر العقارات الساحلية والائتمان (نموذج)', 'Banking & Real Estate', 'Enterprise & Sovereign', 100, 'Climate Underwriting Officer', 'مسؤول الاكتتاب والمخاطر المناخية', 'delta-risk,esg-reporting,urban-heat,trend-alerts', now);
-    insertWs.run('ws-metro-municipality', 'Metropolitan Heat & Air Corridor (Sample)', 'ممر الحرارة وجودة الهواء الحضري (نموذج)', 'Municipalities & Healthcare', 'Enterprise & Sovereign', 100, 'Urban Resilience Director', 'مدير المرونة الحضرية والبلدية', 'urban-heat,air-dust,esg-reporting,trend-alerts', now);
-    insertWs.run('ws-basin-irrigation', 'Regional Basin Irrigation & Tourism (Sample)', 'إدارة أحواض الري والسياحة الإقليمية (نموذج)', 'Irrigation & Tourism', 'Sector Pro Tier', 25, 'Hydrological Planning Analyst', 'محلل التخطيط الهيدرولوجي والري', 'water-monitoring,crop-health,air-dust,esg-reporting', now);
+    insertWs.run('ws-delta-agro', 'Nile Delta Agro-Export Portfolio (Sample)', 'محفظة التصدير الزراعي بدلتا النيل (نموذج)', 'Agriculture & Exporting', 'Sector Pro Tier', 25, 'Agronomy & Export Risk Lead', 'مدير مخاطر الزراعة والتصدير', 'crop-health,water-monitoring,delta-risk,trend-alerts', 'org-nile-agro', now);
+    insertWs.run('ws-coastal-banking', 'Coastal Real Estate & Credit Risk (Sample)', 'مخاطر العقارات الساحلية والائتمان (نموذج)', 'Banking & Real Estate', 'Enterprise & Sovereign', 100, 'Climate Underwriting Officer', 'مسؤول الاكتتاب والمخاطر المناخية', 'delta-risk,esg-reporting,urban-heat,trend-alerts', 'org-coastal-finance', now);
+    insertWs.run('ws-metro-municipality', 'Metropolitan Heat & Air Corridor (Sample)', 'ممر الحرارة وجودة الهواء الحضري (نموذج)', 'Municipalities & Healthcare', 'Enterprise & Sovereign', 100, 'Urban Resilience Director', 'مدير المرونة الحضرية والبلدية', 'urban-heat,air-dust,esg-reporting,trend-alerts', 'org-coastal-finance', now);
+    insertWs.run('ws-basin-irrigation', 'Regional Basin Irrigation & Tourism (Sample)', 'إدارة أحواض الري والسياحة الإقليمية (نموذج)', 'Irrigation & Tourism', 'Sector Pro Tier', 25, 'Hydrological Planning Analyst', 'محلل التخطيط الهيدرولوجي والري', 'water-monitoring,crop-health,air-dust,esg-reporting', 'org-nile-agro', now);
 
     const insertAoi = db.prepare(`
       INSERT INTO aoi_locations (id, workspace_id, name_en, name_ar, lat, lon, radius_km, region_code, primary_module)
@@ -182,6 +268,10 @@ function seedInitialData() {
     insertReport.run('rep-sample-102', 'ws-delta-agro', 'Delta Horizon Growers Co-op (Sample)', 'Agriculture & Exporting', 'CSRD ESRS E1/E4', 'crop-health,water-monitoring', 30.732, 31.719, 'Custom Paid Report Request', 'SCOPING_REVIEW', now);
   }
 
+  // Ensure seeded workspaces are associated with their tenant organizations on upgrades
+  db.prepare(`UPDATE workspaces SET organization_id = 'org-nile-agro' WHERE id IN ('ws-delta-agro', 'ws-basin-irrigation') AND organization_id = 'org-climato-demo'`).run();
+  db.prepare(`UPDATE workspaces SET organization_id = 'org-coastal-finance' WHERE id IN ('ws-coastal-banking', 'ws-metro-municipality') AND organization_id = 'org-climato-demo'`).run();
+
   // Default sandbox evaluation key: hashed at rest, bound to ws-delta-agro, disabled in production
   const disableDemoKey =
     process.env.NODE_ENV === 'production' || process.env.CLIMATO_DISABLE_DEMO_KEY === 'true';
@@ -196,16 +286,17 @@ function seedInitialData() {
   } else {
     db.prepare(`
       INSERT INTO api_keys (
-        id, label, token_value, token_hash, token_prefix, workspace_id,
+        id, label, token_value, token_hash, token_prefix, workspace_id, organization_id,
         environment, scopes, rate_limit_rpm, last_used_at, revoked_at, created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
       ON CONFLICT(id) DO UPDATE SET
         label = excluded.label,
         token_value = excluded.token_value,
         token_hash = excluded.token_hash,
         token_prefix = excluded.token_prefix,
         workspace_id = excluded.workspace_id,
+        organization_id = excluded.organization_id,
         scopes = excluded.scopes,
         rate_limit_rpm = excluded.rate_limit_rpm,
         revoked_at = NULL
@@ -216,6 +307,7 @@ function seedInitialData() {
       defaultHash,
       defaultMasked,
       'ws-delta-agro',
+      'org-nile-agro',
       'sandbox',
       'modules:read,reports:write,alerts:write,connectors:read,geospatial:analyze',
       120,

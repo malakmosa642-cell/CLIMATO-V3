@@ -17,6 +17,7 @@ import {
   SlidersHorizontal,
   Upload,
 } from 'lucide-react';
+import type { AuthOrgSummary, AuthUserSummary } from '../components/AuthModal';
 import DashboardShell from '../components/DashboardShell';
 import {
   Language,
@@ -33,6 +34,10 @@ import {
 interface TrendDetectiveViewProps {
   lang: Language;
   onNavigate: (route: PageRoute) => void;
+  authUser?: AuthUserSummary | null;
+  authOrg?: AuthOrgSummary | null;
+  onOpenAuth?: () => void;
+  onLogout?: () => void;
 }
 
 const REGION_COLORS: Record<StudyRegionId, string> = {
@@ -48,7 +53,14 @@ const DATASET_ACCENTS: Record<ScienceDatasetId, string> = {
   'grace-fo': '#38BDF8',
 };
 
-export default function TrendDetectiveView({ lang, onNavigate }: TrendDetectiveViewProps) {
+export default function TrendDetectiveView({
+  lang,
+  onNavigate,
+  authUser,
+  authOrg,
+  onOpenAuth,
+  onLogout,
+}: TrendDetectiveViewProps) {
   const isAr = lang === 'ar';
 
   const [regions, setRegions] = useState<StudyRegion[]>([]);
@@ -122,7 +134,7 @@ export default function TrendDetectiveView({ lang, onNavigate }: TrendDetectiveV
         temporalAggregation: tAgg,
         mode: runMode,
       });
-      const res = await fetch(`/api/science/compare?${qs.toString()}`);
+      const res = await fetch(`/api/science/compare?${qs.toString()}`, { credentials: 'include' });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error?.message || 'Comparison failed');
       setRegionalResults(data.regionalAnalyses || []);
@@ -170,6 +182,7 @@ export default function TrendDetectiveView({ lang, onNavigate }: TrendDetectiveV
       const res = await fetch(`/api/science/regions/${editingRegionId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           centerLat: Number(editDraft.centerLat),
           centerLon: Number(editDraft.centerLon),
@@ -195,7 +208,16 @@ export default function TrendDetectiveView({ lang, onNavigate }: TrendDetectiveV
   };
 
   const resetAllRegions = async () => {
-    await fetch('/api/science/regions/reset', { method: 'POST' });
+    setErrorMsg(null);
+    const res = await fetch('/api/science/regions/reset', {
+      method: 'POST',
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setErrorMsg(data?.error?.message || 'Sign in as admin required to reset study regions.');
+      return;
+    }
     setEditingRegionId(null);
     loadOverview();
     runComparison();
@@ -221,6 +243,7 @@ export default function TrendDetectiveView({ lang, onNavigate }: TrendDetectiveV
       const res = await fetch('/api/science/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           datasetId: selectedDatasetId,
           regionId: importRegionId,
@@ -271,6 +294,10 @@ export default function TrendDetectiveView({ lang, onNavigate }: TrendDetectiveV
       route="detective"
       onNavigate={onNavigate}
       breadcrumb={isAr ? 'محقق اتجاهات نظام الأرض بمصر' : 'Egypt Earth System Trend Detective'}
+      authUser={authUser}
+      authOrg={authOrg}
+      onOpenAuth={onOpenAuth}
+      onLogout={onLogout}
     >
       <div className="space-y-6">
         {/* MISSION HEADER */}

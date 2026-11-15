@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import Navbar from './components/Navbar';
 import Footer from './components/Footer';
+import AuthModal, { AuthOrgSummary, AuthUserSummary } from './components/AuthModal';
 import LandingView from './views/LandingView';
 import ModulesView from './views/ModulesView';
 import SectorsView from './views/SectorsView';
@@ -18,6 +19,7 @@ import {
   Language,
   ModuleId,
   PageRoute,
+  SampleObservation,
   SatelliteConnector,
   SectorId,
   WorkspaceRecord,
@@ -36,6 +38,10 @@ export default function App() {
   const [aois, setAois] = useState<AoiLocation[]>([]);
   const [connectors, setConnectors] = useState<SatelliteConnector[]>([]);
 
+  const [authUser, setAuthUser] = useState<AuthUserSummary | null>(null);
+  const [authOrg, setAuthOrg] = useState<AuthOrgSummary | null>(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+
   // Synchronize document direction, language, and localized SEO title
   useEffect(() => {
     const html = document.documentElement;
@@ -47,18 +53,65 @@ export default function App() {
         : 'CLIMATO – Geospatial Climate Intelligence for Egypt';
   }, [lang]);
 
-  const fetchWorkspacesAndAois = () => {
-    fetch('/api/workspaces')
-      .then((r) => r.json())
+  const loadPublicSampleAoisFallback = () => {
+    fetch('/api/observations?limit=50', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : { observations: [] }))
       .then((data) => {
+        const obsList: SampleObservation[] = data.observations || [];
+        const uniqueMap = new Map<string, AoiLocation>();
+        for (const o of obsList) {
+          if (!uniqueMap.has(o.aoi_id)) {
+            uniqueMap.set(o.aoi_id, {
+              id: o.aoi_id,
+              workspace_id: o.workspace_id,
+              name_en: o.aoi_name_en,
+              name_ar: o.aoi_name_ar,
+              lat: o.lat,
+              lon: o.lon,
+              radius_km: 18,
+              region_code: 'EG-SAMPLE',
+              primary_module: o.module_id,
+            });
+          }
+        }
+        setAois(Array.from(uniqueMap.values()));
+      })
+      .catch(() => {});
+  };
+
+  const fetchWorkspacesAndAois = () => {
+    fetch('/api/workspaces', { credentials: 'include' })
+      .then(async (r) => {
+        if (!r.ok) {
+          setWorkspaces([]);
+          loadPublicSampleAoisFallback();
+          return;
+        }
+        const data = await r.json();
         setWorkspaces(data.workspaces || []);
         setAois(data.aois || []);
       })
       .catch(() => {});
   };
 
-  // Load initial workspaces, AOIs, and staged satellite connectors from Express SQLite API
+  const fetchAuthSession = () => {
+    fetch('/api/auth/me', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : { authenticated: false }))
+      .then((data) => {
+        if (data.authenticated && data.user) {
+          setAuthUser(data.user);
+          setAuthOrg(data.organization || null);
+        } else {
+          setAuthUser(null);
+          setAuthOrg(null);
+        }
+      })
+      .catch(() => {});
+  };
+
+  // Load initial session, workspaces/AOIs, and staged satellite connectors
   useEffect(() => {
+    fetchAuthSession();
     fetchWorkspacesAndAois();
 
     fetch('/api/connectors')
@@ -68,6 +121,19 @@ export default function App() {
       })
       .catch(() => {});
   }, []);
+
+  const handleAuthSuccess = (user: AuthUserSummary, org: AuthOrgSummary | null) => {
+    setAuthUser(user);
+    setAuthOrg(org);
+    fetchWorkspacesAndAois();
+  };
+
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => {});
+    setAuthUser(null);
+    setAuthOrg(null);
+    fetchWorkspacesAndAois();
+  };
 
   const handleNavigate = (
     targetRoute: PageRoute,
@@ -90,6 +156,13 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const authProps = {
+    authUser,
+    authOrg,
+    onOpenAuth: () => setShowAuthModal(true),
+    onLogout: handleLogout,
+  };
+
   return (
     <div className="min-h-screen flex flex-col bg-[#020403] text-slate-100">
       <Navbar
@@ -110,11 +183,11 @@ export default function App() {
         )}
 
         {route === 'detective' && (
-          <TrendDetectiveView lang={lang} onNavigate={(r) => handleNavigate(r)} />
+          <TrendDetectiveView lang={lang} onNavigate={(r) => handleNavigate(r)} {...authProps} />
         )}
 
         {route === 'research' && (
-          <ResearchHubView lang={lang} onNavigate={(r) => handleNavigate(r)} />
+          <ResearchHubView lang={lang} onNavigate={(r) => handleNavigate(r)} {...authProps} />
         )}
 
         {route === 'modules' && (
@@ -145,6 +218,7 @@ export default function App() {
             onSelectModule={setDashboardModuleFilter}
             onSelectAoi={setSelectedAoiId}
             onNavigate={(r) => handleNavigate(r)}
+            {...authProps}
           />
         )}
 
@@ -155,15 +229,16 @@ export default function App() {
             aois={aois}
             onNavigate={handleNavigate}
             onRefresh={fetchWorkspacesAndAois}
+            {...authProps}
           />
         )}
 
         {route === 'reports' && (
-          <ReportsView lang={lang} onNavigate={(r) => handleNavigate(r)} />
+          <ReportsView lang={lang} onNavigate={(r) => handleNavigate(r)} {...authProps} />
         )}
 
         {route === 'alerts' && (
-          <AlertsView lang={lang} onNavigate={(r) => handleNavigate(r)} />
+          <AlertsView lang={lang} onNavigate={(r) => handleNavigate(r)} {...authProps} />
         )}
 
         {route === 'api' && (
@@ -171,6 +246,8 @@ export default function App() {
             lang={lang}
             connectors={connectors}
             onNavigate={(r) => handleNavigate(r)}
+            authUser={authUser}
+            onOpenAuth={() => setShowAuthModal(true)}
           />
         )}
 
@@ -182,6 +259,13 @@ export default function App() {
           <ContactDemoView lang={lang} initialPlan={planInterest} />
         )}
       </main>
+
+      <AuthModal
+        lang={lang}
+        isOpen={showAuthModal}
+        onClose={() => setShowAuthModal(false)}
+        onSuccess={handleAuthSuccess}
+      />
 
       <Footer lang={lang} onNavigate={(r) => handleNavigate(r)} />
     </div>

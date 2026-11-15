@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Download, FileText, CheckCircle2 } from 'lucide-react';
+import { CheckCircle2, Download, FileText, KeyRound } from 'lucide-react';
+import type { AuthOrgSummary, AuthUserSummary } from '../components/AuthModal';
 import DashboardShell from '../components/DashboardShell';
 import SampleDataBanner from '../components/SampleDataBanner';
 import { MODULES, SECTORS } from '../data/bilingualContent';
@@ -8,9 +9,20 @@ import { Language, ModuleId, PageRoute, ReportRecord } from '../types/climate';
 interface ReportsViewProps {
   lang: Language;
   onNavigate: (route: PageRoute) => void;
+  authUser?: AuthUserSummary | null;
+  authOrg?: AuthOrgSummary | null;
+  onOpenAuth?: () => void;
+  onLogout?: () => void;
 }
 
-export default function ReportsView({ lang, onNavigate }: ReportsViewProps) {
+export default function ReportsView({
+  lang,
+  onNavigate,
+  authUser,
+  authOrg,
+  onOpenAuth,
+  onLogout,
+}: ReportsViewProps) {
   const isAr = lang === 'ar';
   const [reports, setReports] = useState<ReportRecord[]>([]);
   const [orgName, setOrgName] = useState('Mediterranean Coastal Portfolio (Sample)');
@@ -22,17 +34,28 @@ export default function ReportsView({ lang, onNavigate }: ReportsViewProps) {
   const [lon, setLon] = useState('29.918');
   const [submitting, setSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [requiresAuth, setRequiresAuth] = useState(false);
 
   const loadReports = () => {
-    fetch('/api/reports')
-      .then((r) => r.json())
-      .then((d) => setReports(d.reports || []))
+    fetch('/api/reports', { credentials: 'include' })
+      .then(async (r) => {
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          if (r.status === 401) {
+            setRequiresAuth(true);
+            setReports([]);
+          }
+          return;
+        }
+        setRequiresAuth(false);
+        setReports(d.reports || []);
+      })
       .catch(() => {});
   };
 
   useEffect(() => {
     loadReports();
-  }, []);
+  }, [authUser?.id]);
 
   const toggleModule = (id: ModuleId) => {
     setSelectedModules((prev) =>
@@ -48,6 +71,7 @@ export default function ReportsView({ lang, onNavigate }: ReportsViewProps) {
       const res = await fetch('/api/reports', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           organizationName: orgName,
           sector,
@@ -58,8 +82,11 @@ export default function ReportsView({ lang, onNavigate }: ReportsViewProps) {
           reportType,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to generate report');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (res.status === 401) setRequiresAuth(true);
+        throw new Error(data?.error?.message || data?.error || 'Failed to generate report');
+      }
       setFeedback(
         isAr
           ? `تم تسجيل التقرير (${data.report.id}) بنجاح.`
@@ -79,6 +106,10 @@ export default function ReportsView({ lang, onNavigate }: ReportsViewProps) {
       route="reports"
       onNavigate={onNavigate}
       breadcrumb={isAr ? 'مولد تقارير المناخ و ESG' : 'Climate & ESG Report Flows'}
+      authUser={authUser}
+      authOrg={authOrg}
+      onOpenAuth={onOpenAuth}
+      onLogout={onLogout}
     >
       <div className="space-y-2">
         <h1 className="font-display text-2xl sm:text-3xl font-bold text-white">
@@ -92,6 +123,26 @@ export default function ReportsView({ lang, onNavigate }: ReportsViewProps) {
       </div>
 
       <SampleDataBanner lang={lang} />
+
+      {requiresAuth && !authUser && (
+        <div className="glass-panel rounded-2xl p-4 border border-[#22FF3A]/35 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs sm:text-sm text-slate-200">
+            {isAr
+              ? 'يرجى تسجيل الدخول للوصول إلى سجل تقارير مؤسستك وتنزيل ملفات PDF و CSV و JSON.'
+              : 'Sign in to access your organization report ledger and export CSV, JSON, or PDF deliverables.'}
+          </p>
+          {onOpenAuth && (
+            <button
+              type="button"
+              onClick={onOpenAuth}
+              className="px-3.5 py-2 rounded-lg bg-[#22FF3A] text-[#020503] text-xs font-bold hover:bg-[#4DFF60] inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <KeyRound className="w-3.5 h-3.5" />
+              <span>{isAr ? 'تسجيل الدخول' : 'Sign In'}</span>
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Report Generator Form */}
@@ -281,6 +332,14 @@ export default function ReportsView({ lang, onNavigate }: ReportsViewProps) {
                   <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-emerald-950/80">
                     <span className="text-[11px] text-slate-400">{rep.report_type}</span>
                     <div className="flex items-center gap-2">
+                      <a
+                        href={`/api/reports/${rep.id}/export?format=pdf`}
+                        download
+                        className="px-3 py-1.5 rounded-md border border-emerald-900 text-xs text-slate-200 hover:border-[#22FF3A]/50 inline-flex items-center gap-1.5"
+                      >
+                        <Download className="w-3.5 h-3.5 text-[#22FF3A]" />
+                        <span>PDF</span>
+                      </a>
                       <a
                         href={`/api/reports/${rep.id}/export?format=csv`}
                         download

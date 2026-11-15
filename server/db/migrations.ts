@@ -355,6 +355,204 @@ export const MIGRATIONS: MigrationDefinition[] = [
       `);
     },
   },
+  {
+    version: 4,
+    name: '004_rbac_orgs_sessions_and_key_lifecycle',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS organizations (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          slug TEXT NOT NULL UNIQUE,
+          plan_tier TEXT NOT NULL DEFAULT 'Sector Pro',
+          monthly_api_quota INTEGER NOT NULL DEFAULT 50000,
+          aoi_quota INTEGER NOT NULL DEFAULT 25,
+          billing_status TEXT NOT NULL DEFAULT 'SANDBOX_ACTIVE',
+          created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          email TEXT NOT NULL UNIQUE,
+          full_name TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('platform_admin', 'org_admin', 'workspace_member', 'authenticated_user')),
+          organization_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'SUSPENDED')),
+          failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+          locked_until TEXT,
+          created_at TEXT NOT NULL,
+          last_login_at TEXT,
+          FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS workspace_memberships (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          workspace_id TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('org_admin', 'workspace_member', 'viewer')),
+          created_at TEXT NOT NULL,
+          UNIQUE(user_id, workspace_id),
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS user_sessions (
+          id TEXT PRIMARY KEY,
+          token_hash TEXT NOT NULL UNIQUE,
+          user_id TEXT NOT NULL,
+          organization_id TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          revoked_at TEXT,
+          ip_address TEXT,
+          user_agent TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+          FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
+      `);
+
+      if (!tableHasColumn(db, 'workspaces', 'organization_id')) {
+        db.exec(`ALTER TABLE workspaces ADD COLUMN organization_id TEXT NOT NULL DEFAULT 'org-climato-demo';`);
+      }
+      if (!tableHasColumn(db, 'api_keys', 'organization_id')) {
+        db.exec(`ALTER TABLE api_keys ADD COLUMN organization_id TEXT NOT NULL DEFAULT 'org-climato-demo';`);
+      }
+      if (!tableHasColumn(db, 'api_keys', 'expires_at')) {
+        db.exec(`ALTER TABLE api_keys ADD COLUMN expires_at TEXT;`);
+      }
+      if (!tableHasColumn(db, 'api_keys', 'rotated_from_id')) {
+        db.exec(`ALTER TABLE api_keys ADD COLUMN rotated_from_id TEXT;`);
+      }
+
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_workspaces_org ON workspaces(organization_id);
+        CREATE INDEX IF NOT EXISTS idx_users_org ON users(organization_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_expires ON user_sessions(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_api_keys_org ON api_keys(organization_id);
+        CREATE INDEX IF NOT EXISTS idx_api_keys_expires ON api_keys(expires_at);
+      `);
+    },
+  },
+  {
+    version: 5,
+    name: '005_alert_null_observed_and_webhooks',
+    up: (db) => {
+      // Rebuild alert_evaluations so observed_value is nullable (NULL for INSUFFICIENT_DATA; never fabricated)
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS alert_evaluations_v5 (
+          id TEXT PRIMARY KEY,
+          alert_id TEXT NOT NULL,
+          matched_aoi_id TEXT,
+          observed_value REAL,
+          threshold_value REAL NOT NULL,
+          breached INTEGER NOT NULL,
+          evaluation_status TEXT NOT NULL DEFAULT 'EVALUATED',
+          webhook_signature TEXT NOT NULL,
+          webhook_timestamp TEXT,
+          delivery_status TEXT NOT NULL,
+          evaluated_at TEXT NOT NULL,
+          FOREIGN KEY (alert_id) REFERENCES trend_alerts(id) ON DELETE CASCADE
+        );
+
+        INSERT INTO alert_evaluations_v5 (
+          id, alert_id, matched_aoi_id, observed_value, threshold_value,
+          breached, evaluation_status, webhook_signature, delivery_status, evaluated_at
+        )
+        SELECT
+          id, alert_id, matched_aoi_id, observed_value, threshold_value,
+          breached, 'EVALUATED', webhook_signature, delivery_status, evaluated_at
+        FROM alert_evaluations;
+
+        DROP TABLE alert_evaluations;
+        ALTER TABLE alert_evaluations_v5 RENAME TO alert_evaluations;
+
+        CREATE INDEX IF NOT EXISTS idx_alert_eval_alert_time ON alert_evaluations(alert_id, evaluated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS webhook_endpoints (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          organization_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          url TEXT NOT NULL,
+          secret_value TEXT NOT NULL,
+          secret_prefix TEXT NOT NULL,
+          events TEXT NOT NULL DEFAULT 'climato.threshold.breached',
+          enabled INTEGER NOT NULL DEFAULT 1,
+          timeout_ms INTEGER NOT NULL DEFAULT 5000,
+          max_retries INTEGER NOT NULL DEFAULT 3,
+          created_at TEXT NOT NULL,
+          rotated_at TEXT,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS webhook_deliveries (
+          id TEXT PRIMARY KEY,
+          endpoint_id TEXT,
+          evaluation_id TEXT,
+          alert_id TEXT,
+          workspace_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          signature_header TEXT NOT NULL,
+          timestamp_header TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('PENDING', 'SENT', 'FAILED', 'RETRYING')),
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          http_status INTEGER,
+          error_message TEXT,
+          next_retry_at TEXT,
+          delivered_at TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (endpoint_id) REFERENCES webhook_endpoints(id) ON DELETE SET NULL,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_ws ON webhook_endpoints(workspace_id, enabled);
+        CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_ws ON webhook_deliveries(workspace_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status ON webhook_deliveries(status, next_retry_at);
+      `);
+    },
+  },
+  {
+    version: 6,
+    name: '006_api_usage_metering_and_provenance',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS api_usage_logs (
+          id TEXT PRIMARY KEY,
+          request_id TEXT NOT NULL,
+          actor_type TEXT NOT NULL,
+          actor_id TEXT NOT NULL,
+          organization_id TEXT,
+          workspace_id TEXT,
+          method TEXT NOT NULL,
+          path TEXT NOT NULL,
+          status_code INTEGER NOT NULL,
+          latency_ms INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_usage_org_created ON api_usage_logs(organization_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_usage_ws_created ON api_usage_logs(workspace_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_usage_actor ON api_usage_logs(actor_id, created_at DESC);
+      `);
+
+      if (!tableHasColumn(db, 'pipeline_runs', 'provenance_checksum')) {
+        db.exec(`ALTER TABLE pipeline_runs ADD COLUMN provenance_checksum TEXT;`);
+      }
+      if (!tableHasColumn(db, 'pipeline_runs', 'ingest_source')) {
+        db.exec(`ALTER TABLE pipeline_runs ADD COLUMN ingest_source TEXT;`);
+      }
+      if (!tableHasColumn(db, 'report_requests', 'report_payload_json')) {
+        db.exec(`ALTER TABLE report_requests ADD COLUMN report_payload_json TEXT;`);
+      }
+      if (!tableHasColumn(db, 'report_requests', 'study_region_id')) {
+        db.exec(`ALTER TABLE report_requests ADD COLUMN study_region_id TEXT;`);
+      }
+    },
+  },
 ];
 
 export function runMigrations(database: DatabaseSync): {

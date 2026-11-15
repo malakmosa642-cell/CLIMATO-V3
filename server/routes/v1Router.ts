@@ -1,13 +1,15 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
-import { db, recordAuditLog } from '../db/database.ts';
+import { db, recordAuditLog, withTransaction } from '../db/database.ts';
 import { hashApiToken, maskApiToken } from '../db/migrations.ts';
 import { executeStagedPreview, listSatelliteConnectors } from '../connectors/satelliteRegistry.ts';
 import {
   ApiError,
   RequestWithContext,
+  assertOrganizationOwnership,
   assertTenantRecordOwnership,
   asyncHandler,
+  parsePagination,
   requireKeyManagementAuth,
   requireScope,
   resolveTenantWorkspaceId,
@@ -15,8 +17,20 @@ import {
 } from '../middleware/requestContext.ts';
 import {
   computeCoordinateRiskProfile,
+  computeScientificCoordinateProfile,
   evaluateGeofenceAlerts,
 } from '../services/geospatialEngine.ts';
+import {
+  ReportRecordRow,
+  buildEnrichedReportBundle,
+  renderReportCsv,
+  renderReportPdf,
+} from '../services/reportService.ts';
+import {
+  assertSafeWebhookUrl,
+  createWebhookEndpoint,
+  rotateWebhookEndpointSecret,
+} from '../services/webhookService.ts';
 
 const VALID_MODULES = new Set([
   'delta-risk',
@@ -43,12 +57,14 @@ function assertValidCoordinates(latRaw: unknown, lonRaw: unknown): { lat: number
   return { lat, lon };
 }
 
-function assertWorkspaceExists(workspaceId: string) {
-  if (workspaceId === '*') return;
-  const ws = db.prepare('SELECT id FROM workspaces WHERE id = ?').get(workspaceId);
+function getWorkspaceRecord(workspaceId: string): { id: string; organization_id: string } {
+  const ws = db
+    .prepare('SELECT id, organization_id FROM workspaces WHERE id = ?')
+    .get(workspaceId) as { id: string; organization_id: string } | undefined;
   if (!ws) {
     throw new ApiError(400, 'INVALID_WORKSPACE', `Workspace '${workspaceId}' does not exist.`);
   }
+  return ws;
 }
 
 export const v1Router = Router();
@@ -66,11 +82,12 @@ v1Router.get('/health', (req: RequestWithContext, res) => {
   });
 });
 
-// Audit Ledger Inspection (Bearer authenticated + scope-gated)
+// Audit Ledger Inspection (Bearer authenticated + scope-gated + paginated)
 v1Router.get(
   '/audit-logs',
   requireScope('audit:read'),
   asyncHandler((req, res) => {
+    const { limit, offset } = parsePagination(req.query, { limit: 50, maxLimit: 100 });
     const tenantWs = req.apiKeyContext?.workspaceId;
     const logs =
       tenantWs && tenantWs !== '*'
@@ -79,50 +96,65 @@ v1Router.get(
               `SELECT id, request_id, actor, action, resource_type, resource_id, metadata, created_at
                FROM audit_logs
                WHERE actor = ? OR metadata LIKE ?
-               ORDER BY created_at DESC LIMIT 50`
+               ORDER BY created_at DESC LIMIT ? OFFSET ?`
             )
-            .all(req.apiKeyContext!.id, `%"workspaceId":"${tenantWs}"%`)
-        : db.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 50').all();
-    res.json({ count: logs.length, logs });
+            .all(req.apiKeyContext!.id, `%"workspaceId":"${tenantWs}"%`, limit, offset)
+        : db
+            .prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ? OFFSET ?')
+            .all(limit, offset);
+    res.json({ count: logs.length, limit, offset, logs });
   })
 );
 
-// Sandbox API Key Management (hashed at rest; masked listing; admin-gated)
-v1Router.get('/keys', requireKeyManagementAuth, (_req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT id, label, token_prefix, workspace_id, environment, scopes, rate_limit_rpm, last_used_at, created_at
-       FROM api_keys
-       WHERE revoked_at IS NULL
-       ORDER BY created_at DESC`
-    )
-    .all() as Array<{
-    id: string;
-    label: string;
-    token_prefix: string | null;
-    workspace_id: string;
-    environment: string;
-    scopes: string;
-    rate_limit_rpm: number;
-    last_used_at: string | null;
-    created_at: string;
-  }>;
+// API Key Management (hashed at rest; masked listing; admin or org_admin gated)
+v1Router.get('/keys', requireKeyManagementAuth, (req: RequestWithContext, res) => {
+  const { limit, offset } = parsePagination(req.query, { limit: 50, maxLimit: 100 });
+  const isPlatformAdmin = req.adminSecretAuthenticated || req.userContext?.role === 'platform_admin';
+
+  const rows = (
+    isPlatformAdmin
+      ? db
+          .prepare(
+            `SELECT k.id, k.label, k.token_prefix, k.workspace_id, COALESCE(w.organization_id, k.organization_id) as organization_id,
+                    k.environment, k.scopes, k.rate_limit_rpm, k.expires_at, k.rotated_from_id, k.last_used_at, k.created_at
+             FROM api_keys k
+             LEFT JOIN workspaces w ON w.id = k.workspace_id
+             WHERE k.revoked_at IS NULL
+             ORDER BY k.created_at DESC LIMIT ? OFFSET ?`
+          )
+          .all(limit, offset)
+      : db
+          .prepare(
+            `SELECT k.id, k.label, k.token_prefix, k.workspace_id, COALESCE(w.organization_id, k.organization_id) as organization_id,
+                    k.environment, k.scopes, k.rate_limit_rpm, k.expires_at, k.rotated_from_id, k.last_used_at, k.created_at
+             FROM api_keys k
+             LEFT JOIN workspaces w ON w.id = k.workspace_id
+             WHERE k.revoked_at IS NULL AND COALESCE(w.organization_id, k.organization_id) = ?
+             ORDER BY k.created_at DESC LIMIT ? OFFSET ?`
+          )
+          .all(req.userContext!.organizationId, limit, offset)
+  ) as Array<Record<string, unknown>>;
 
   const keys = rows.map((row) => ({
     id: row.id,
     label: row.label,
     workspace_id: row.workspace_id,
+    organization_id: row.organization_id,
     token_masked: row.token_prefix || '****',
     token_value: row.token_prefix || '****',
     environment: row.environment,
     scopes: row.scopes,
     rate_limit_rpm: row.rate_limit_rpm,
+    expires_at: row.expires_at ?? null,
+    rotated_from_id: row.rotated_from_id ?? null,
     last_used_at: row.last_used_at,
     created_at: row.created_at,
   }));
 
   res.json({
     keys,
+    limit,
+    offset,
     adminSecretConfigured: Boolean(process.env.CLIMATO_ADMIN_SECRET?.trim()),
   });
 });
@@ -130,22 +162,34 @@ v1Router.get('/keys', requireKeyManagementAuth, (_req, res) => {
 v1Router.post(
   '/keys',
   requireKeyManagementAuth,
-  asyncHandler((req, res) => {
+  asyncHandler((req: RequestWithContext, res) => {
     const {
       label,
       workspaceId = 'ws-delta-agro',
       scopes = 'modules:read,reports:write,alerts:write,connectors:read,geospatial:analyze',
       rateLimitRpm = 120,
+      expiresInDays,
     } = req.body ?? {};
     if (!label || !String(label).trim()) {
       throw new ApiError(400, 'MISSING_KEY_LABEL', 'Key label is required.');
     }
 
     const cleanWorkspaceId = String(workspaceId).trim() || 'ws-delta-agro';
-    assertWorkspaceExists(cleanWorkspaceId);
+    const ws = getWorkspaceRecord(cleanWorkspaceId);
+    assertOrganizationOwnership(req, ws.organization_id, `workspace '${cleanWorkspaceId}'`);
 
     const parsedRpm = Number(rateLimitRpm);
-    const cleanRpm = Number.isFinite(parsedRpm) && parsedRpm >= 1 && parsedRpm <= 10_000 ? Math.floor(parsedRpm) : 120;
+    const cleanRpm =
+      Number.isFinite(parsedRpm) && parsedRpm >= 1 && parsedRpm <= 10_000 ? Math.floor(parsedRpm) : 120;
+
+    let expiresAt: string | null = null;
+    if (expiresInDays !== undefined && expiresInDays !== null && expiresInDays !== '') {
+      const days = Number(expiresInDays);
+      if (!Number.isFinite(days) || days <= 0 || days > 3650) {
+        throw new ApiError(400, 'INVALID_EXPIRY', 'expiresInDays must be between 1 and 3650.');
+      }
+      expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+    }
 
     const id = `key-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`;
     const randomPart = crypto.randomBytes(16).toString('hex');
@@ -155,31 +199,40 @@ v1Router.post(
     const now = new Date().toISOString();
     const cleanScopes = Array.isArray(scopes) ? scopes.join(',') : String(scopes);
 
-    db.prepare(`
-      INSERT INTO api_keys (
-        id, label, token_value, token_hash, token_prefix, workspace_id,
-        environment, scopes, rate_limit_rpm, last_used_at, revoked_at, created_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, 'sandbox', ?, ?, NULL, NULL, ?)
-    `).run(
-      id,
-      String(label).trim(),
-      tokenPrefix,
-      tokenHash,
-      tokenPrefix,
-      cleanWorkspaceId,
-      cleanScopes,
-      cleanRpm,
-      now
-    );
+    withTransaction(() => {
+      db.prepare(`
+        INSERT INTO api_keys (
+          id, label, token_value, token_hash, token_prefix, workspace_id, organization_id,
+          environment, scopes, rate_limit_rpm, expires_at, last_used_at, revoked_at, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'sandbox', ?, ?, ?, NULL, NULL, ?)
+      `).run(
+        id,
+        String(label).trim(),
+        tokenPrefix,
+        tokenHash,
+        tokenPrefix,
+        cleanWorkspaceId,
+        ws.organization_id,
+        cleanScopes,
+        cleanRpm,
+        expiresAt,
+        now
+      );
+    });
 
     recordAuditLog({
       requestId: req.requestId || 'unknown',
-      actor: 'api-portal',
+      actor: req.userContext?.userId || 'api-portal',
       action: 'API_KEY_CREATED',
       resourceType: 'api_key',
       resourceId: id,
-      metadata: { label: String(label).trim(), workspaceId: cleanWorkspaceId },
+      metadata: {
+        label: String(label).trim(),
+        workspaceId: cleanWorkspaceId,
+        organizationId: ws.organization_id,
+        expiresAt,
+      },
     });
 
     res.status(201).json({
@@ -187,11 +240,13 @@ v1Router.post(
         id,
         label: String(label).trim(),
         workspace_id: cleanWorkspaceId,
+        organization_id: ws.organization_id,
         token_value: rawToken,
         token_masked: tokenPrefix,
         environment: 'sandbox',
         scopes: cleanScopes,
         rate_limit_rpm: cleanRpm,
+        expires_at: expiresAt,
         last_used_at: null,
         created_at: now,
       },
@@ -201,27 +256,126 @@ v1Router.post(
   })
 );
 
+v1Router.post(
+  '/keys/:id/rotate',
+  requireKeyManagementAuth,
+  asyncHandler((req: RequestWithContext, res) => {
+    const oldId = String(req.params.id);
+    if (oldId === 'key-sbx-default') {
+      throw new ApiError(400, 'DEFAULT_SANDBOX_KEY_PROTECTED', 'The default evaluation sandbox key cannot be rotated.');
+    }
+
+    const oldKey = db
+      .prepare('SELECT * FROM api_keys WHERE id = ?')
+      .get(oldId) as
+      | {
+          id: string;
+          label: string;
+          workspace_id: string;
+          organization_id: string;
+          scopes: string;
+          rate_limit_rpm: number;
+          expires_at: string | null;
+          revoked_at: string | null;
+        }
+      | undefined;
+
+    if (!oldKey || oldKey.revoked_at !== null) {
+      throw new ApiError(404, 'API_KEY_NOT_FOUND', 'API key not found or already revoked.');
+    }
+    assertOrganizationOwnership(req, oldKey.organization_id, `API key '${oldId}'`);
+
+    const newId = `key-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`;
+    const rawToken = `clm_sbx_${crypto.randomBytes(16).toString('hex')}`;
+    const tokenHash = hashApiToken(rawToken);
+    const tokenPrefix = maskApiToken(rawToken);
+    const now = new Date().toISOString();
+
+    const expiresInDays = req.body?.expiresInDays;
+    let nextExpiresAt = oldKey.expires_at;
+    if (expiresInDays !== undefined && expiresInDays !== null) {
+      const days = Number(expiresInDays);
+      if (!Number.isFinite(days) || days <= 0 || days > 3650) {
+        throw new ApiError(400, 'INVALID_EXPIRY', 'expiresInDays must be between 1 and 3650.');
+      }
+      nextExpiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+    }
+
+    withTransaction(() => {
+      db.prepare('UPDATE api_keys SET revoked_at = ? WHERE id = ?').run(now, oldId);
+      db.prepare(`
+        INSERT INTO api_keys (
+          id, label, token_value, token_hash, token_prefix, workspace_id, organization_id,
+          environment, scopes, rate_limit_rpm, expires_at, rotated_from_id, last_used_at, revoked_at, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'sandbox', ?, ?, ?, ?, NULL, NULL, ?)
+      `).run(
+        newId,
+        oldKey.label,
+        tokenPrefix,
+        tokenHash,
+        tokenPrefix,
+        oldKey.workspace_id,
+        oldKey.organization_id,
+        oldKey.scopes,
+        oldKey.rate_limit_rpm,
+        nextExpiresAt,
+        oldId,
+        now
+      );
+    });
+
+    recordAuditLog({
+      requestId: req.requestId || 'unknown',
+      actor: req.userContext?.userId || 'api-portal',
+      action: 'API_KEY_ROTATED',
+      resourceType: 'api_key',
+      resourceId: newId,
+      metadata: { rotatedFromId: oldId, workspaceId: oldKey.workspace_id },
+    });
+
+    res.status(201).json({
+      rotatedFromId: oldId,
+      key: {
+        id: newId,
+        label: oldKey.label,
+        workspace_id: oldKey.workspace_id,
+        organization_id: oldKey.organization_id,
+        token_value: rawToken,
+        token_masked: tokenPrefix,
+        environment: 'sandbox',
+        scopes: oldKey.scopes,
+        rate_limit_rpm: oldKey.rate_limit_rpm,
+        expires_at: nextExpiresAt,
+        rotated_from_id: oldId,
+        created_at: now,
+      },
+    });
+  })
+);
+
 v1Router.delete(
   '/keys/:id',
   requireKeyManagementAuth,
-  asyncHandler((req, res) => {
+  asyncHandler((req: RequestWithContext, res) => {
     const id = String(req.params.id);
     if (id === 'key-sbx-default') {
       throw new ApiError(400, 'DEFAULT_SANDBOX_KEY_PROTECTED', 'The default evaluation sandbox key cannot be deleted.');
     }
     const existing = db
-      .prepare('SELECT id, revoked_at FROM api_keys WHERE id = ?')
-      .get(id) as { id: string; revoked_at: string | null } | undefined;
+      .prepare('SELECT id, organization_id, revoked_at FROM api_keys WHERE id = ?')
+      .get(id) as { id: string; organization_id: string; revoked_at: string | null } | undefined;
     if (!existing || existing.revoked_at !== null) {
       throw new ApiError(404, 'API_KEY_NOT_FOUND', 'API key not found or already revoked.');
     }
+    assertOrganizationOwnership(req, existing.organization_id, `API key '${id}'`);
 
     const revokedAt = new Date().toISOString();
     db.prepare('UPDATE api_keys SET revoked_at = ? WHERE id = ?').run(revokedAt, id);
 
     recordAuditLog({
       requestId: req.requestId || 'unknown',
-      actor: 'api-portal',
+      actor: req.userContext?.userId || 'api-portal',
       action: 'API_KEY_REVOKED',
       resourceType: 'api_key',
       resourceId: id,
@@ -245,14 +399,25 @@ v1Router.get(
   })
 );
 
-// Multi-Hazard Coordinate Risk Profile Analyzer (Haversine + Egypt Corridor Classification)
+// Multi-Hazard / Scientific Coordinate Profile Analyzer
 v1Router.post(
   '/climate/analyze',
   requireScope('geospatial:analyze'),
   asyncHandler((req, res) => {
     const { lat, lon } = assertValidCoordinates(req.body?.lat ?? 31.404, req.body?.lon ?? 30.416);
-    const profile = computeCoordinateRiskProfile(lat, lon);
+    const mode = String(req.body?.mode || 'DEMONSTRATION_SAMPLE').toUpperCase();
 
+    if (mode === 'SCIENTIFIC') {
+      const sciProfile = computeScientificCoordinateProfile(
+        lat,
+        lon,
+        typeof req.body?.datasetId === 'string' ? req.body.datasetId : undefined
+      );
+      res.json({ requestId: req.requestId, ...sciProfile });
+      return;
+    }
+
+    const profile = computeCoordinateRiskProfile(lat, lon);
     recordAuditLog({
       requestId: req.requestId || 'unknown',
       actor: req.apiKeyContext?.id || 'api-user',
@@ -273,7 +438,7 @@ v1Router.post(
   })
 );
 
-// Seven Climate Modules Data Endpoint (Tenant-Isolated)
+// Seven Climate Modules Data Endpoint (Tenant-Isolated + Paginated)
 v1Router.get(
   '/modules/:moduleId/data',
   requireScope('modules:read'),
@@ -289,6 +454,7 @@ v1Router.get(
 
     const tenantWs = resolveTenantWorkspaceId(req, req.query.workspaceId);
     const { aoiId, period } = req.query;
+    const { limit, offset } = parsePagination(req.query, { limit: 50, maxLimit: 200 });
 
     if (typeof aoiId === 'string' && aoiId.trim() && aoiId !== 'all') {
       const aoiRow = db
@@ -301,7 +467,7 @@ v1Router.get(
 
     let query =
       'SELECT o.*, a.name_en as aoi_name_en, a.name_ar as aoi_name_ar, a.lat, a.lon, a.radius_km, a.workspace_id FROM sample_observations o JOIN aoi_locations a ON o.aoi_id = a.id WHERE o.module_id = ?';
-    const params: string[] = [moduleId];
+    const params: Array<string | number> = [moduleId];
 
     if (tenantWs !== '*') {
       query += ' AND a.workspace_id = ?';
@@ -316,7 +482,8 @@ v1Router.get(
       query += ' AND o.period_label = ?';
       params.push(period.trim());
     }
-    query += ' ORDER BY o.id ASC';
+    query += ' ORDER BY o.id ASC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
 
     const records = db.prepare(query).all(...params);
     res.json({
@@ -327,12 +494,13 @@ v1Router.get(
       dataProvenance: 'SAMPLE_DEMONSTRATION',
       notice: 'Sandbox demonstration dataset. Connect staged satellite ingestion workers for live verified telemetry.',
       count: records.length,
+      limit,
+      offset,
       records,
     });
   })
 );
 
-// Staged Satellite Connector Registry
 v1Router.get('/connectors', requireScope('connectors:read'), (_req, res) => {
   const connectors = listSatelliteConnectors();
   res.json({
@@ -348,14 +516,15 @@ v1Router.get(
   requireScope('modules:read'),
   asyncHandler((req, res) => {
     const tenantWs = resolveTenantWorkspaceId(req, req.query.workspaceId);
+    const { limit, offset } = parsePagination(req.query, { limit: 50, maxLimit: 100 });
     const workspaces =
       tenantWs === '*'
-        ? db.prepare('SELECT * FROM workspaces ORDER BY created_at ASC').all()
+        ? db.prepare('SELECT * FROM workspaces ORDER BY created_at ASC LIMIT ? OFFSET ?').all(limit, offset)
         : db.prepare('SELECT * FROM workspaces WHERE id = ? ORDER BY created_at ASC').all(tenantWs);
     const aois =
       tenantWs === '*'
-        ? db.prepare('SELECT * FROM aoi_locations ORDER BY id ASC').all()
-        : db.prepare('SELECT * FROM aoi_locations WHERE workspace_id = ? ORDER BY id ASC').all(tenantWs);
+        ? db.prepare('SELECT * FROM aoi_locations ORDER BY id ASC LIMIT ? OFFSET ?').all(limit, offset)
+        : db.prepare('SELECT * FROM aoi_locations WHERE workspace_id = ? ORDER BY id ASC LIMIT ? OFFSET ?').all(tenantWs, limit, offset);
 
     res.json({
       workspaceId: tenantWs,
@@ -383,7 +552,7 @@ v1Router.post(
     } = req.body ?? {};
 
     const workspaceId = resolveTenantWorkspaceId(req, requestedWorkspaceId);
-    assertWorkspaceExists(workspaceId);
+    getWorkspaceRecord(workspaceId);
 
     if (!nameEn || !String(nameEn).trim()) {
       throw new ApiError(400, 'MISSING_AOI_NAME', 'AOI nameEn is required.');
@@ -423,17 +592,20 @@ v1Router.post(
   })
 );
 
-// Climate & ESG Report Endpoints (Tenant-Isolated)
+// Climate & ESG Report Endpoints (Tenant-Isolated + JSON/CSV/PDF Export)
 v1Router.get(
   '/reports',
   requireScope('modules:read'),
   asyncHandler((req, res) => {
     const tenantWs = resolveTenantWorkspaceId(req, req.query.workspaceId);
+    const { limit, offset } = parsePagination(req.query, { limit: 25, maxLimit: 100 });
     const reports =
       tenantWs === '*'
-        ? db.prepare('SELECT * FROM report_requests ORDER BY created_at DESC').all()
-        : db.prepare('SELECT * FROM report_requests WHERE workspace_id = ? ORDER BY created_at DESC').all(tenantWs);
-    res.json({ workspaceId: tenantWs, isSampleData: true, dataProvenance: 'SAMPLE_DEMONSTRATION', reports });
+        ? db.prepare('SELECT * FROM report_requests ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit, offset)
+        : db
+            .prepare('SELECT * FROM report_requests WHERE workspace_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?')
+            .all(tenantWs, limit, offset);
+    res.json({ workspaceId: tenantWs, isSampleData: true, dataProvenance: 'SAMPLE_DEMONSTRATION', limit, offset, reports });
   })
 );
 
@@ -450,10 +622,11 @@ v1Router.post(
       lat = 30.044,
       lon = 31.235,
       reportType = 'Standard Sandbox Export',
+      studyRegionId = null,
     } = req.body ?? {};
 
     const workspaceId = resolveTenantWorkspaceId(req, requestedWorkspaceId);
-    assertWorkspaceExists(workspaceId);
+    getWorkspaceRecord(workspaceId);
 
     if (!organizationName || !sector || !standard || !Array.isArray(moduleIds) || moduleIds.length === 0) {
       throw new ApiError(
@@ -469,8 +642,11 @@ v1Router.post(
     const status = reportType === 'Custom Paid Report Request' ? 'SCOPING_REVIEW' : 'READY_SAMPLE';
 
     db.prepare(`
-      INSERT INTO report_requests (id, workspace_id, organization_name, sector, standard, module_ids, lat, lon, report_type, status, data_provenance, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SAMPLE_DEMONSTRATION', ?)
+      INSERT INTO report_requests (
+        id, workspace_id, organization_name, sector, standard, module_ids, lat, lon,
+        report_type, status, data_provenance, study_region_id, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SAMPLE_DEMONSTRATION', ?, ?)
     `).run(
       id,
       workspaceId,
@@ -482,6 +658,7 @@ v1Router.post(
       coords.lon,
       String(reportType),
       status,
+      studyRegionId ? String(studyRegionId) : null,
       now
     );
 
@@ -501,6 +678,7 @@ v1Router.post(
       exportUrls: {
         json: `/api/v1/reports/${id}/export?format=json`,
         csv: `/api/v1/reports/${id}/export?format=csv`,
+        pdf: `/api/v1/reports/${id}/export?format=pdf`,
       },
       report: created,
     });
@@ -514,82 +692,47 @@ v1Router.get(
     const id = String(req.params.id);
     const format = String(req.query.format || 'json').toLowerCase();
     const report = db.prepare('SELECT * FROM report_requests WHERE id = ?').get(id) as
-      | (Record<string, unknown> & { workspace_id: string })
+      | ReportRecordRow
       | undefined;
     if (!report) {
       throw new ApiError(404, 'REPORT_NOT_FOUND', `Report '${id}' not found.`);
     }
 
     assertTenantRecordOwnership(req, report.workspace_id, `report '${id}'`);
-
-    const observations = db
-      .prepare(
-        `SELECT o.* FROM sample_observations o
-         JOIN aoi_locations a ON o.aoi_id = a.id
-         WHERE a.workspace_id = ?
-         LIMIT 16`
-      )
-      .all(report.workspace_id) as Array<Record<string, unknown>>;
+    const bundle = buildEnrichedReportBundle(report);
+    db.prepare(
+      'UPDATE report_requests SET study_region_id = COALESCE(study_region_id, ?), report_payload_json = ? WHERE id = ?'
+    ).run(bundle.scientificSummary.studyRegion.id, JSON.stringify(bundle), id);
 
     if (format === 'csv') {
-      const headers = [
-        'report_id',
-        'workspace_id',
-        'organization',
-        'standard',
-        'data_provenance',
-        'aoi_id',
-        'module_id',
-        'source_name',
-        'period_label',
-        'metric_key',
-        'metric_value',
-        'unit',
-      ];
-      const lines = [headers.join(',')];
-      for (const obs of observations) {
-        lines.push(
-          [
-            report.id,
-            report.workspace_id,
-            `"${String(report.organization_name).replace(/"/g, '""')}"`,
-            `"${String(report.standard)}"`,
-            'SAMPLE_DEMONSTRATION_NOT_LIVE',
-            obs.aoi_id,
-            obs.module_id,
-            `"${String(obs.source_name)}"`,
-            obs.period_label,
-            obs.metric_key,
-            obs.metric_value,
-            obs.unit,
-          ].join(',')
-        );
-      }
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="${id}-sample-climate-report.csv"`);
-      res.send(lines.join('\n'));
+      res.setHeader('Content-Disposition', `attachment; filename="${id}-climate-report.csv"`);
+      res.send(renderReportCsv(bundle));
       return;
     }
 
-    res.json({
-      disclaimer:
-        'SAMPLE DEMONSTRATION REPORT — Generated from platform sandbox records. Connect verified satellite workers for audited production disclosures.',
-      report,
-      sampleObservationsIncluded: observations,
-      exportedAt: new Date().toISOString(),
-    });
+    if (format === 'pdf') {
+      const pdfBuf = renderReportPdf(bundle);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${id}-climate-report.pdf"`);
+      res.send(pdfBuf);
+      return;
+    }
+
+    res.json(bundle);
   })
 );
 
-// Coordinate Trend Alerts & Real Geofence Evaluation Endpoints (Tenant-Isolated)
+// Coordinate Trend Alerts & Real Geofence Evaluation + Webhooks
 v1Router.get(
   '/alerts',
   requireScope('modules:read'),
   asyncHandler((req, res) => {
     const tenantWs = resolveTenantWorkspaceId(req, req.query.workspaceId);
     const { moduleId } = req.query;
+    const { limit, offset } = parsePagination(req.query, { limit: 25, maxLimit: 100 });
     let query = 'SELECT * FROM trend_alerts WHERE 1=1';
-    const params: string[] = [];
+    const params: Array<string | number> = [];
     if (tenantWs !== '*') {
       query += ' AND workspace_id = ?';
       params.push(tenantWs);
@@ -598,9 +741,10 @@ v1Router.get(
       query += ' AND module_id = ?';
       params.push(moduleId);
     }
-    query += ' ORDER BY created_at DESC';
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
     const alerts = db.prepare(query).all(...params);
-    res.json({ workspaceId: tenantWs, isSampleData: true, dataProvenance: 'SAMPLE_DEMONSTRATION', alerts });
+    res.json({ workspaceId: tenantWs, isSampleData: true, dataProvenance: 'SAMPLE_DEMONSTRATION', limit, offset, alerts });
   })
 );
 
@@ -625,7 +769,7 @@ v1Router.post(
     } = req.body ?? {};
 
     const workspaceId = resolveTenantWorkspaceId(req, requestedWorkspaceId);
-    assertWorkspaceExists(workspaceId);
+    getWorkspaceRecord(workspaceId);
 
     if (!titleEn || !moduleId || typeof thresholdValue !== 'number' || !Number.isFinite(thresholdValue)) {
       throw new ApiError(
@@ -684,7 +828,7 @@ v1Router.post(
 v1Router.post(
   '/alerts/:id/evaluate',
   requireScope('alerts:write'),
-  asyncHandler((req, res) => {
+  asyncHandler(async (req, res) => {
     const id = String(req.params.id);
     const existing = db
       .prepare('SELECT id, workspace_id FROM trend_alerts WHERE id = ?')
@@ -694,7 +838,16 @@ v1Router.post(
     }
     assertTenantRecordOwnership(req, existing.workspace_id, `alert '${id}'`);
 
-    const evaluations = evaluateGeofenceAlerts(id, req.requestId || 'v1-eval');
+    const explicitWebhookUrl =
+      typeof req.body?.webhookUrl === 'string' && req.body.webhookUrl.trim()
+        ? req.body.webhookUrl.trim()
+        : undefined;
+
+    const evaluations = await evaluateGeofenceAlerts(
+      id,
+      req.requestId || 'v1-eval',
+      explicitWebhookUrl
+    );
     res.json({
       requestId: req.requestId,
       isSampleData: true,
@@ -717,9 +870,66 @@ v1Router.get(
     }
     assertTenantRecordOwnership(req, existing.workspace_id, `alert '${id}'`);
 
+    const { limit, offset } = parsePagination(req.query, { limit: 20, maxLimit: 100 });
     const rows = db
-      .prepare('SELECT * FROM alert_evaluations WHERE alert_id = ? ORDER BY evaluated_at DESC LIMIT 20')
-      .all(id);
+      .prepare('SELECT * FROM alert_evaluations WHERE alert_id = ? ORDER BY evaluated_at DESC LIMIT ? OFFSET ?')
+      .all(id, limit, offset);
     res.json({ isSampleData: true, dataProvenance: 'SAMPLE_DEMONSTRATION', evaluations: rows });
+  })
+);
+
+// Workspace Webhook Endpoints (Tenant-Isolated)
+v1Router.get(
+  '/webhooks',
+  requireScope('modules:read'),
+  asyncHandler((req, res) => {
+    const tenantWs = resolveTenantWorkspaceId(req, req.query.workspaceId);
+    const endpoints =
+      tenantWs === '*'
+        ? db
+            .prepare(
+              'SELECT id, workspace_id, organization_id, name as label, url as target_url, secret_prefix, enabled, created_at, rotated_at, updated_at FROM webhook_endpoints ORDER BY created_at DESC'
+            )
+            .all()
+        : db
+            .prepare(
+              'SELECT id, workspace_id, organization_id, name as label, url as target_url, secret_prefix, enabled, created_at, rotated_at, updated_at FROM webhook_endpoints WHERE workspace_id = ? ORDER BY created_at DESC'
+            )
+            .all(tenantWs);
+    res.json({ workspaceId: tenantWs, endpoints });
+  })
+);
+
+v1Router.post(
+  '/webhooks',
+  requireScope('alerts:write'),
+  asyncHandler(async (req, res) => {
+    const { workspaceId: requestedWs, label, targetUrl } = req.body ?? {};
+    const workspaceId = resolveTenantWorkspaceId(req, requestedWs);
+    getWorkspaceRecord(workspaceId);
+
+    if (!label || !String(label).trim() || !targetUrl || !String(targetUrl).trim()) {
+      throw new ApiError(400, 'VALIDATION_ERROR', 'label and targetUrl are required.');
+    }
+
+    try {
+      await assertSafeWebhookUrl(String(targetUrl));
+    } catch (err) {
+      throw new ApiError(400, 'INVALID_WEBHOOK_URL', err instanceof Error ? err.message : 'Invalid webhook URL.');
+    }
+
+    const created = createWebhookEndpoint({
+      workspaceId,
+      label: String(label),
+      targetUrl: String(targetUrl),
+      requestId: req.requestId,
+      actor: req.apiKeyContext?.id || 'v1-api',
+    });
+
+    res.status(201).json({
+      endpoint: created.endpoint,
+      signingSecret: created.rawSecret,
+      notice: 'Store this webhook signing secret now; it is encrypted at rest and masked in subsequent listings.',
+    });
   })
 );

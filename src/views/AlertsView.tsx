@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { BellPlus, Play, ShieldCheck, Trash2 } from 'lucide-react';
+import { BellPlus, KeyRound, Play, ShieldCheck, Trash2 } from 'lucide-react';
+import type { AuthOrgSummary, AuthUserSummary } from '../components/AuthModal';
 import DashboardShell from '../components/DashboardShell';
 import SampleDataBanner from '../components/SampleDataBanner';
 import { MODULES } from '../data/bilingualContent';
@@ -8,22 +9,35 @@ import { Language, ModuleId, PageRoute, TrendAlert } from '../types/climate';
 interface AlertsViewProps {
   lang: Language;
   onNavigate: (route: PageRoute) => void;
+  authUser?: AuthUserSummary | null;
+  authOrg?: AuthOrgSummary | null;
+  onOpenAuth?: () => void;
+  onLogout?: () => void;
 }
 
 interface EvaluationResult {
   evaluationId: string;
   alertId: string;
-  observedValue: number;
+  evaluationStatus?: 'EVALUATED' | 'INSUFFICIENT_DATA';
+  observedValue: number | null;
   thresholdValue: number;
   operator: string;
   unit: string;
   breached: boolean;
   deliveryStatus: string;
-  webhookSignatureHeader: string;
+  webhookSignatureHeader: string | null;
   evaluatedAt: string;
+  detail?: string;
 }
 
-export default function AlertsView({ lang, onNavigate }: AlertsViewProps) {
+export default function AlertsView({
+  lang,
+  onNavigate,
+  authUser,
+  authOrg,
+  onOpenAuth,
+  onLogout,
+}: AlertsViewProps) {
   const isAr = lang === 'ar';
   const [alerts, setAlerts] = useState<TrendAlert[]>([]);
   const [filterModule, setFilterModule] = useState<string>('all');
@@ -41,27 +55,44 @@ export default function AlertsView({ lang, onNavigate }: AlertsViewProps) {
   const [saving, setSaving] = useState(false);
   const [evaluatingId, setEvaluatingId] = useState<string | null>(null);
   const [evaluationsMap, setEvaluationsMap] = useState<Record<string, EvaluationResult>>({});
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [requiresAuth, setRequiresAuth] = useState(false);
 
   const loadAlerts = () => {
     const params = filterModule !== 'all' ? `?moduleId=${filterModule}` : '';
-    fetch(`/api/alerts${params}`)
-      .then((r) => r.json())
-      .then((d) => setAlerts(d.alerts || []))
+    fetch(`/api/alerts${params}`, { credentials: 'include' })
+      .then(async (r) => {
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          if (r.status === 401) {
+            setRequiresAuth(true);
+            setAlerts([]);
+          } else {
+            setErrorMsg(d?.error?.message || 'Unable to load alerts.');
+          }
+          return;
+        }
+        setRequiresAuth(false);
+        setErrorMsg(null);
+        setAlerts(d.alerts || []);
+      })
       .catch(() => {});
   };
 
   useEffect(() => {
     loadAlerts();
-  }, [filterModule]);
+  }, [filterModule, authUser?.id]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!titleEn.trim()) return;
     setSaving(true);
+    setErrorMsg(null);
     try {
       const res = await fetch('/api/alerts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           titleEn,
           titleAr: titleAr || titleEn,
@@ -77,11 +108,15 @@ export default function AlertsView({ lang, onNavigate }: AlertsViewProps) {
           channel: 'Webhook + Email',
         }),
       });
-      if (res.ok) {
-        setTitleEn('');
-        setTitleAr('');
-        loadAlerts();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(data?.error?.message || 'Unable to create alert rule.');
+        if (res.status === 401) setRequiresAuth(true);
+        return;
       }
+      setTitleEn('');
+      setTitleAr('');
+      loadAlerts();
     } finally {
       setSaving(false);
     }
@@ -89,10 +124,18 @@ export default function AlertsView({ lang, onNavigate }: AlertsViewProps) {
 
   const evaluateNow = async (id: string) => {
     setEvaluatingId(id);
+    setErrorMsg(null);
     try {
-      const res = await fetch(`/api/alerts/${id}/evaluate`, { method: 'POST' });
-      const data = await res.json();
-      if (res.ok && data.evaluation) {
+      const res = await fetch(`/api/alerts/${id}/evaluate`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(data?.error?.message || 'Unable to evaluate alert.');
+        return;
+      }
+      if (data.evaluation) {
         setEvaluationsMap((prev) => ({ ...prev, [id]: data.evaluation }));
         loadAlerts();
       }
@@ -102,16 +145,27 @@ export default function AlertsView({ lang, onNavigate }: AlertsViewProps) {
   };
 
   const toggleAlert = async (alert: TrendAlert) => {
-    await fetch(`/api/alerts/${alert.id}`, {
+    const res = await fetch(`/api/alerts/${alert.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ enabled: alert.enabled !== 1 }),
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setErrorMsg(data?.error?.message || 'Unable to update alert status.');
+      return;
+    }
     loadAlerts();
   };
 
   const deleteAlert = async (id: string) => {
-    await fetch(`/api/alerts/${id}`, { method: 'DELETE' });
+    const res = await fetch(`/api/alerts/${id}`, { method: 'DELETE', credentials: 'include' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setErrorMsg(data?.error?.message || 'Unable to delete alert.');
+      return;
+    }
     loadAlerts();
   };
 
@@ -121,6 +175,10 @@ export default function AlertsView({ lang, onNavigate }: AlertsViewProps) {
       route="alerts"
       onNavigate={onNavigate}
       breadcrumb={isAr ? 'تنبيهات الاتجاهات حسب الإحداثيات' : 'Coordinate-Based Trend Alerts'}
+      authUser={authUser}
+      authOrg={authOrg}
+      onOpenAuth={onOpenAuth}
+      onLogout={onLogout}
     >
       <div className="space-y-2">
         <h1 className="font-display text-2xl sm:text-3xl font-bold text-white">
@@ -134,6 +192,27 @@ export default function AlertsView({ lang, onNavigate }: AlertsViewProps) {
       </div>
 
       <SampleDataBanner lang={lang} />
+
+      {(requiresAuth || errorMsg) && (
+        <div className="rounded-xl border border-rose-500/40 bg-rose-950/30 px-4 py-3 text-xs text-rose-200 flex flex-wrap items-center justify-between gap-3">
+          <span>
+            {errorMsg ||
+              (isAr
+                ? 'يرجى تسجيل الدخول لإدارة وتقييم قواعد التنبيهات الخاصة بمؤسستك.'
+                : 'Sign in to view, create, and evaluate tenant-isolated geofence alert rules.')}
+          </span>
+          {!authUser && onOpenAuth && (
+            <button
+              type="button"
+              onClick={onOpenAuth}
+              className="px-3 py-1.5 rounded-lg bg-[#22FF3A] text-[#020503] text-xs font-bold hover:bg-[#4DFF60] inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <KeyRound className="w-3.5 h-3.5" />
+              <span>{isAr ? 'تسجيل الدخول' : 'Sign In'}</span>
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Create Alert Rule Form */}
@@ -378,21 +457,43 @@ export default function AlertsView({ lang, onNavigate }: AlertsViewProps) {
                     {evalRes && (
                       <div className="rounded-lg border border-emerald-900/70 bg-[#051209] p-3 text-[11px] font-mono space-y-1">
                         <div className="flex flex-wrap items-center justify-between gap-2">
-                          <span className="flex items-center gap-1.5 text-[#22FF3A]">
+                          <span
+                            className={`flex items-center gap-1.5 ${
+                              evalRes.evaluationStatus === 'INSUFFICIENT_DATA'
+                                ? 'text-amber-300'
+                                : evalRes.breached
+                                ? 'text-rose-300'
+                                : 'text-[#22FF3A]'
+                            }`}
+                          >
                             <ShieldCheck className="w-3.5 h-3.5" />
                             <span>
-                              {evalRes.breached
-                                ? isAr ? 'تجاوز العتبة (تم التوقيع)' : 'THRESHOLD BREACHED (SIGNED)'
-                                : isAr ? 'ضمن النطاق الطبيعي' : 'NOMINAL'}
+                              {evalRes.evaluationStatus === 'INSUFFICIENT_DATA'
+                                ? isAr
+                                  ? 'بيانات غير كافية (INSUFFICIENT_DATA)'
+                                  : 'INSUFFICIENT_DATA'
+                                : evalRes.breached
+                                ? isAr
+                                  ? `تجاوز العتبة (${evalRes.deliveryStatus})`
+                                  : `THRESHOLD BREACHED (${evalRes.deliveryStatus})`
+                                : isAr
+                                ? 'ضمن النطاق الطبيعي'
+                                : 'NOMINAL'}
                             </span>
                           </span>
                           <span className="text-slate-300 tabular-nums">
-                            Observed: {evalRes.observedValue} {evalRes.unit} (Threshold: {evalRes.operator} {evalRes.thresholdValue})
+                            Observed:{' '}
+                            {evalRes.observedValue !== null
+                              ? `${evalRes.observedValue} ${evalRes.unit}`
+                              : 'NULL'}{' '}
+                            (Threshold: {evalRes.operator} {evalRes.thresholdValue})
                           </span>
                         </div>
-                        <div className="text-slate-400 truncate" dir="ltr">
-                          X-Climato-Signature: {evalRes.webhookSignatureHeader}
-                        </div>
+                        {evalRes.webhookSignatureHeader && (
+                          <div className="text-slate-400 truncate" dir="ltr">
+                            X-Climato-Signature: {evalRes.webhookSignatureHeader}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

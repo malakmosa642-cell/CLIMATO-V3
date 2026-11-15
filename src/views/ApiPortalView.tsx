@@ -10,11 +10,13 @@ import {
   KeyRound,
   Play,
   Plus,
+  RefreshCw,
   Scale,
   Terminal,
   Trash2,
   Webhook,
 } from 'lucide-react';
+import type { AuthUserSummary } from '../components/AuthModal';
 import SampleDataBanner from '../components/SampleDataBanner';
 import {
   API_ENDPOINTS,
@@ -29,6 +31,8 @@ interface ApiPortalViewProps {
   lang: Language;
   connectors: SatelliteConnector[];
   onNavigate: (route: PageRoute) => void;
+  authUser?: AuthUserSummary | null;
+  onOpenAuth?: () => void;
 }
 
 type PortalSection =
@@ -48,11 +52,19 @@ interface ApiKeyRow {
   environment: string;
   scopes: string;
   rate_limit_rpm: number;
+  expires_at?: string | null;
+  rotated_from_id?: string | null;
   last_used_at: string | null;
   created_at: string;
 }
 
-export default function ApiPortalView({ lang, connectors, onNavigate }: ApiPortalViewProps) {
+export default function ApiPortalView({
+  lang,
+  connectors,
+  onNavigate,
+  authUser,
+  onOpenAuth,
+}: ApiPortalViewProps) {
   const isAr = lang === 'ar';
   const [section, setSection] = useState<PortalSection>('sandbox');
   const [activeEndpointId, setActiveEndpointId] = useState<string>('climate-summary');
@@ -63,7 +75,11 @@ export default function ApiPortalView({ lang, connectors, onNavigate }: ApiPorta
   const [apiKeys, setApiKeys] = useState<ApiKeyRow[]>([]);
   const [selectedToken, setSelectedToken] = useState<string>('clm_sbx_demo_9f4a2c81e0b7');
   const [newKeyLabel, setNewKeyLabel] = useState('');
+  const [expiresInDays, setExpiresInDays] = useState('');
   const [creatingKey, setCreatingKey] = useState(false);
+  const [adminSecretInput, setAdminSecretInput] = useState('');
+  const [keyErrorMsg, setKeyErrorMsg] = useState<string | null>(null);
+  const [newlyIssuedToken, setNewlyIssuedToken] = useState<{ label: string; token: string } | null>(null);
 
   // Interactive Sandbox Runner state
   const activeEndpoint: ApiEndpointDoc =
@@ -84,10 +100,30 @@ export default function ApiPortalView({ lang, connectors, onNavigate }: ApiPorta
     body: string;
   } | null>(null);
 
+  const buildKeyMgmtHeaders = (extra?: Record<string, string>): Record<string, string> => {
+    const h: Record<string, string> = { ...(extra || {}) };
+    if (adminSecretInput.trim()) {
+      h['X-Climato-Admin-Secret'] = adminSecretInput.trim();
+    }
+    if (customTokenInput.trim()) {
+      h.Authorization = `Bearer ${customTokenInput.trim()}`;
+    }
+    return h;
+  };
+
   const loadKeys = () => {
-    fetch('/api/v1/keys')
-      .then((r) => r.json())
-      .then((d) => {
+    fetch('/api/v1/keys', {
+      credentials: 'include',
+      headers: buildKeyMgmtHeaders(),
+    })
+      .then(async (r) => {
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          setApiKeys([]);
+          setKeyErrorMsg(d?.error?.message || 'Sign in as org_admin or supply Admin Secret to manage API keys.');
+          return;
+        }
+        setKeyErrorMsg(null);
         const list: ApiKeyRow[] = d.keys || [];
         setApiKeys(list);
       })
@@ -96,7 +132,7 @@ export default function ApiPortalView({ lang, connectors, onNavigate }: ApiPorta
 
   useEffect(() => {
     loadKeys();
-  }, []);
+  }, [authUser?.id]);
 
   const selectEndpoint = (ep: ApiEndpointDoc) => {
     setActiveEndpointId(ep.id);
@@ -129,17 +165,29 @@ export default function ApiPortalView({ lang, connectors, onNavigate }: ApiPorta
     e.preventDefault();
     if (!newKeyLabel.trim()) return;
     setCreatingKey(true);
+    setKeyErrorMsg(null);
     try {
+      const payload: Record<string, unknown> = { label: newKeyLabel.trim() };
+      if (expiresInDays.trim()) {
+        payload.expiresInDays = Number(expiresInDays);
+      }
       const res = await fetch('/api/v1/keys', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: newKeyLabel.trim() }),
+        credentials: 'include',
+        headers: buildKeyMgmtHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(payload),
       });
-      const data = await res.json();
-      if (res.ok && data.key) {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setKeyErrorMsg(data?.error?.message || 'Unable to generate API key.');
+        return;
+      }
+      if (data.key) {
         setNewKeyLabel('');
+        setExpiresInDays('');
         setSelectedToken(data.key.token_value);
         setCustomTokenInput(data.key.token_value);
+        setNewlyIssuedToken({ label: data.key.label, token: data.key.token_value });
         loadKeys();
       }
     } finally {
@@ -147,8 +195,39 @@ export default function ApiPortalView({ lang, connectors, onNavigate }: ApiPorta
     }
   };
 
+  const handleRotateKey = async (id: string) => {
+    setKeyErrorMsg(null);
+    const res = await fetch(`/api/v1/keys/${id}/rotate`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: buildKeyMgmtHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setKeyErrorMsg(data?.error?.message || 'Unable to rotate key.');
+      return;
+    }
+    if (data.key) {
+      setSelectedToken(data.key.token_value);
+      setCustomTokenInput(data.key.token_value);
+      setNewlyIssuedToken({ label: `${data.key.label} (Rotated)`, token: data.key.token_value });
+    }
+    loadKeys();
+  };
+
   const handleRevokeKey = async (id: string) => {
-    await fetch(`/api/v1/keys/${id}`, { method: 'DELETE' });
+    setKeyErrorMsg(null);
+    const res = await fetch(`/api/v1/keys/${id}`, {
+      method: 'DELETE',
+      credentials: 'include',
+      headers: buildKeyMgmtHeaders(),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setKeyErrorMsg(data?.error?.message || 'Unable to revoke key.');
+      return;
+    }
     loadKeys();
   };
 
@@ -672,10 +751,73 @@ export function verifyWebhookSignature(rawBody, signatureHeader, webhookSecret) 
                   </h2>
                   <p className="text-sm text-slate-300">
                     {isAr
-                      ? 'أرسل مفتاح API في ترويسة Authorization: Bearer <KEY>. يمكنك إنشاء مفاتيح اختبار محلية أو إلغاؤها فوراً.'
-                      : 'Pass your scoped API key via Authorization: Bearer <KEY>. Create or revoke sandbox keys below and test invalid-key 401 handling directly in the Sandbox Runner.'}
+                      ? 'أرسل مفتاح API في ترويسة Authorization: Bearer <KEY>. تتطلب إدارة المفاتيح جلسة org_admin / platform_admin أو إدخال X-Climato-Admin-Secret وقت التشغيل.'
+                      : 'Pass your scoped API key via Authorization: Bearer <KEY>. Managing keys requires an org_admin/platform_admin session or runtime X-Climato-Admin-Secret.'}
                   </p>
                 </div>
+
+                {/* Optional Runtime Admin Secret Input (Memory Only) */}
+                <div className="rounded-xl bg-[#030A05] border border-emerald-950 p-4 flex flex-wrap items-center gap-3">
+                  <input
+                    type="password"
+                    dir="ltr"
+                    value={adminSecretInput}
+                    onChange={(e) => setAdminSecretInput(e.target.value)}
+                    placeholder={
+                      isAr
+                        ? 'X-Climato-Admin-Secret (اختياري لمدير المنصة)'
+                        : 'Optional runtime X-Climato-Admin-Secret'
+                    }
+                    className="flex-1 min-w-[220px] bg-[#020604] border border-emerald-900 rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-[#22FF3A]"
+                  />
+                  <button
+                    type="button"
+                    onClick={loadKeys}
+                    className="px-3.5 py-2 rounded-lg border border-emerald-800 text-xs font-medium text-emerald-200 hover:border-[#22FF3A]/50 cursor-pointer"
+                  >
+                    {isAr ? 'تحديث المفاتيح' : 'Refresh Key Registry'}
+                  </button>
+                  {!authUser && onOpenAuth && (
+                    <button
+                      type="button"
+                      onClick={onOpenAuth}
+                      className="px-3.5 py-2 rounded-lg bg-[#22FF3A]/15 border border-[#22FF3A]/40 text-xs font-semibold text-[#22FF3A] hover:bg-[#22FF3A]/25 cursor-pointer"
+                    >
+                      {isAr ? 'تسجيل دخول المؤسسة' : 'Sign In Organization'}
+                    </button>
+                  )}
+                </div>
+
+                {keyErrorMsg && (
+                  <div className="rounded-lg border border-amber-500/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">
+                    {keyErrorMsg}
+                  </div>
+                )}
+
+                {newlyIssuedToken && (
+                  <div className="rounded-xl border border-[#22FF3A]/50 bg-[#051509] p-4 space-y-2">
+                    <div className="text-xs font-semibold text-[#22FF3A]">
+                      {isAr
+                        ? 'تحذير أمني: يُعرض هذا المفتاح الكامل مرة واحدة فقط. يتم تخزين بصمة SHA-256 فقط على الخادم.'
+                        : 'One-Time Secret Reveal: Save this full token now. Only its SHA-256 digest is stored server-side.'}
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                      <span className="text-slate-300">{newlyIssuedToken.label}</span>
+                      <div className="flex items-center gap-2">
+                        <code dir="ltr" className="text-[#22FF3A] break-all">
+                          {newlyIssuedToken.token}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() => handleCopy('new-token', newlyIssuedToken.token)}
+                          className="px-2.5 py-1 rounded border border-[#22FF3A]/40 text-[#22FF3A] hover:bg-[#22FF3A]/15 cursor-pointer"
+                        >
+                          {copiedId === 'new-token' ? (isAr ? 'تم النسخ' : 'Copied') : isAr ? 'نسخ' : 'Copy'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 <form onSubmit={handleCreateKey} className="flex flex-wrap gap-3">
                   <input
@@ -684,7 +826,16 @@ export function verifyWebhookSignature(rawBody, signatureHeader, webhookSecret) 
                     value={newKeyLabel}
                     onChange={(e) => setNewKeyLabel(e.target.value)}
                     placeholder={isAr ? 'تسمية المفتاح الجديد (مثال: تكامل مخاطر البنك)' : 'New key label (e.g. Banking Risk Staging)'}
-                    className="flex-1 min-w-[220px] bg-[#030A05] border border-emerald-950 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-[#22FF3A]"
+                    className="flex-1 min-w-[200px] bg-[#030A05] border border-emerald-950 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-[#22FF3A]"
+                  />
+                  <input
+                    type="number"
+                    min={1}
+                    max={3650}
+                    value={expiresInDays}
+                    onChange={(e) => setExpiresInDays(e.target.value)}
+                    placeholder={isAr ? 'الصلاحية بالأيام (اختياري)' : 'Expiry days (optional)'}
+                    className="w-40 bg-[#030A05] border border-emerald-950 rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-[#22FF3A]"
                   />
                   <button
                     type="submit"
@@ -692,7 +843,7 @@ export function verifyWebhookSignature(rawBody, signatureHeader, webhookSecret) 
                     className="px-4 py-2 rounded-lg bg-[#22FF3A] text-[#020503] text-xs font-semibold hover:bg-[#4DFF60] inline-flex items-center gap-1.5 cursor-pointer"
                   >
                     <Plus className="w-3.5 h-3.5" />
-                    <span>{creatingKey ? (isAr ? 'جارٍ الإنشاء...' : 'Generating...') : isAr ? 'توليد مفتاح اختبار' : 'Generate Sandbox Key'}</span>
+                    <span>{creatingKey ? (isAr ? 'جارٍ الإنشاء...' : 'Generating...') : isAr ? 'توليد مفتاح' : 'Generate Key'}</span>
                   </button>
                 </form>
 
@@ -710,37 +861,38 @@ export function verifyWebhookSignature(rawBody, signatureHeader, webhookSecret) 
                           <span className="text-slate-400">{k.rate_limit_rpm} req/min</span>
                           <span className="text-slate-500">·</span>
                           <span className="text-emerald-300">{k.scopes}</span>
+                          {k.expires_at && (
+                            <>
+                              <span className="text-slate-500">·</span>
+                              <span className="text-amber-300">Exp: {k.expires_at.slice(0, 10)}</span>
+                            </>
+                          )}
+                          {k.rotated_from_id && (
+                            <>
+                              <span className="text-slate-500">·</span>
+                              <span className="text-slate-400">Rotated</span>
+                            </>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
                         <button
                           type="button"
-                          onClick={() => handleCopy(k.id, k.token_value)}
-                          className="px-3 py-1.5 rounded-lg border border-emerald-900 text-xs text-slate-200 hover:border-[#22FF3A]/50 inline-flex items-center gap-1.5 cursor-pointer"
+                          onClick={() => handleRotateKey(k.id)}
+                          title={isAr ? 'تدوير المفتاح' : 'Rotate key'}
+                          className="px-2.5 py-1.5 rounded-lg border border-emerald-900 text-xs text-slate-200 hover:border-[#22FF3A]/50 inline-flex items-center gap-1 cursor-pointer"
                         >
-                          {copiedId === k.id ? <Check className="w-3.5 h-3.5 text-[#22FF3A]" /> : <Copy className="w-3.5 h-3.5" />}
-                          <span>{copiedId === k.id ? (isAr ? 'نُسخ' : 'Copied') : isAr ? 'نسخ' : 'Copy'}</span>
+                          <RefreshCw className="w-3.5 h-3.5 text-[#22FF3A]" />
+                          <span>{isAr ? 'تدوير' : 'Rotate'}</span>
                         </button>
                         <button
                           type="button"
-                          onClick={() => {
-                            setCustomTokenInput(k.token_value);
-                            setSection('sandbox');
-                          }}
-                          className="px-3 py-1.5 rounded-lg bg-[#22FF3A]/15 border border-[#22FF3A]/40 text-xs text-[#22FF3A] hover:bg-[#22FF3A]/25 cursor-pointer"
+                          onClick={() => handleRevokeKey(k.id)}
+                          aria-label="Revoke API key"
+                          className="p-1.5 rounded-lg border border-emerald-950 text-slate-400 hover:text-rose-300 hover:border-rose-500/40 cursor-pointer"
                         >
-                          {isAr ? 'استخدام في Sandbox' : 'Use in Sandbox'}
+                          <Trash2 className="w-3.5 h-3.5" />
                         </button>
-                        {apiKeys.length > 1 && (
-                          <button
-                            type="button"
-                            onClick={() => handleRevokeKey(k.id)}
-                            aria-label="Revoke API key"
-                            className="p-1.5 rounded-lg border border-emerald-950 text-slate-400 hover:text-rose-300 hover:border-rose-500/40 cursor-pointer"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        )}
                       </div>
                     </div>
                   ))}

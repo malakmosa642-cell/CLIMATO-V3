@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { db, recordAuditLog } from '../db/database.ts';
+import { db, recordAuditLog, withTransaction } from '../db/database.ts';
 import {
   DEFAULT_STUDY_REGIONS,
   RESEARCH_SOURCES,
@@ -19,11 +19,19 @@ import {
   runScientificPipeline,
   TemporalAggregationMode,
 } from '../services/scientificPipeline.ts';
-import { ApiError, asyncHandler, RequestWithContext } from '../middleware/requestContext.ts';
+import { computeScientificCoordinateProfile } from '../services/geospatialEngine.ts';
+import {
+  ApiError,
+  asyncHandler,
+  parsePagination,
+  RequestWithContext,
+  requireAuthenticated,
+  requireRoles,
+} from '../middleware/requestContext.ts';
 
 export const scienceRouter = Router();
 
-// 1. Overview: Regions, 4 Datasets, Connector Readiness, All 12 Research Hub Sources
+// 1. PUBLIC READ-ONLY: Overview of Regions, 4 Datasets, Connector Readiness (booleans only), & Research Hub
 scienceRouter.get(
   '/overview',
   asyncHandler(async (_req: RequestWithContext, res) => {
@@ -47,7 +55,9 @@ scienceRouter.get(
     });
 
     const recentRuns = db
-      .prepare('SELECT id, dataset_id, region_id, start_date, end_date, temporal_aggregation, provenance_type, status, query_hash, records_ingested, valid_records, missing_periods, created_at FROM pipeline_runs ORDER BY created_at DESC LIMIT 20')
+      .prepare(
+        'SELECT id, dataset_id, region_id, start_date, end_date, temporal_aggregation, provenance_type, status, query_hash, records_ingested, valid_records, missing_periods, created_at FROM pipeline_runs ORDER BY created_at DESC LIMIT 20'
+      )
       .all();
 
     res.json({
@@ -61,9 +71,11 @@ scienceRouter.get(
   })
 );
 
-// 2. Configure Egyptian Study Region coordinates / bounding box
+// 2. PROTECTED: Configure Egyptian Study Region coordinates / bounding box
 scienceRouter.put(
   '/regions/:id',
+  requireAuthenticated,
+  requireRoles('workspace_member', 'org_admin', 'platform_admin'),
   asyncHandler((req: RequestWithContext, res) => {
     const id = String(req.params.id);
     const existing = listStudyRegionsFromDb().find((r) => r.id === id);
@@ -100,32 +112,34 @@ scienceRouter.put(
     );
 
     const nowIso = new Date().toISOString();
-    db.prepare(`
-      UPDATE study_regions
-      SET name_en = ?, name_ar = ?, center_lat = ?, center_lon = ?,
-          min_lat = ?, max_lat = ?, min_lon = ?, max_lon = ?,
-          approx_area_km2 = ?, selection_rationale_en = ?, selection_rationale_ar = ?,
-          is_default = 0, updated_at = ?
-      WHERE id = ?
-    `).run(
-      String(body.nameEn || existing.nameEn).trim(),
-      String(body.nameAr || existing.nameAr).trim(),
-      Number(centerLat.toFixed(4)),
-      Number(centerLon.toFixed(4)),
-      Number(minLat.toFixed(4)),
-      Number(maxLat.toFixed(4)),
-      Number(minLon.toFixed(4)),
-      Number(maxLon.toFixed(4)),
-      approxAreaKm2,
-      String(body.selectionRationaleEn || existing.selectionRationaleEn).trim(),
-      String(body.selectionRationaleAr || existing.selectionRationaleAr).trim(),
-      nowIso,
-      id
-    );
+    withTransaction(() => {
+      db.prepare(`
+        UPDATE study_regions
+        SET name_en = ?, name_ar = ?, center_lat = ?, center_lon = ?,
+            min_lat = ?, max_lat = ?, min_lon = ?, max_lon = ?,
+            approx_area_km2 = ?, selection_rationale_en = ?, selection_rationale_ar = ?,
+            is_default = 0, updated_at = ?
+        WHERE id = ?
+      `).run(
+        String(body.nameEn || existing.nameEn).trim(),
+        String(body.nameAr || existing.nameAr).trim(),
+        Number(centerLat.toFixed(4)),
+        Number(centerLon.toFixed(4)),
+        Number(minLat.toFixed(4)),
+        Number(maxLat.toFixed(4)),
+        Number(minLon.toFixed(4)),
+        Number(maxLon.toFixed(4)),
+        approxAreaKm2,
+        String(body.selectionRationaleEn || existing.selectionRationaleEn).trim(),
+        String(body.selectionRationaleAr || existing.selectionRationaleAr).trim(),
+        nowIso,
+        id
+      );
+    });
 
     recordAuditLog({
       requestId: req.requestId || 'science-region-update',
-      actor: 'researcher',
+      actor: req.userContext?.userId || req.apiKeyContext?.id || 'researcher',
       action: 'STUDY_REGION_RECONFIGURED',
       resourceType: 'study_region',
       resourceId: id,
@@ -137,38 +151,43 @@ scienceRouter.put(
   })
 );
 
+// PROTECTED: Reset Study Regions
 scienceRouter.post(
   '/regions/reset',
+  requireAuthenticated,
+  requireRoles('org_admin', 'platform_admin'),
   asyncHandler((req: RequestWithContext, res) => {
     const nowIso = new Date().toISOString();
-    const stmt = db.prepare(`
-      UPDATE study_regions
-      SET name_en = ?, name_ar = ?, center_lat = ?, center_lon = ?,
-          min_lat = ?, max_lat = ?, min_lon = ?, max_lon = ?,
-          approx_area_km2 = ?, selection_rationale_en = ?, selection_rationale_ar = ?,
-          is_default = 1, updated_at = ?
-      WHERE id = ?
-    `);
-    for (const r of DEFAULT_STUDY_REGIONS) {
-      stmt.run(
-        r.nameEn,
-        r.nameAr,
-        r.centerLat,
-        r.centerLon,
-        r.minLat,
-        r.maxLat,
-        r.minLon,
-        r.maxLon,
-        r.approxAreaKm2,
-        r.selectionRationaleEn,
-        r.selectionRationaleAr,
-        nowIso,
-        r.id
-      );
-    }
+    withTransaction(() => {
+      const stmt = db.prepare(`
+        UPDATE study_regions
+        SET name_en = ?, name_ar = ?, center_lat = ?, center_lon = ?,
+            min_lat = ?, max_lat = ?, min_lon = ?, max_lon = ?,
+            approx_area_km2 = ?, selection_rationale_en = ?, selection_rationale_ar = ?,
+            is_default = 1, updated_at = ?
+        WHERE id = ?
+      `);
+      for (const r of DEFAULT_STUDY_REGIONS) {
+        stmt.run(
+          r.nameEn,
+          r.nameAr,
+          r.centerLat,
+          r.centerLon,
+          r.minLat,
+          r.maxLat,
+          r.minLon,
+          r.maxLon,
+          r.approxAreaKm2,
+          r.selectionRationaleEn,
+          r.selectionRationaleAr,
+          nowIso,
+          r.id
+        );
+      }
+    });
     recordAuditLog({
       requestId: req.requestId || 'science-region-reset',
-      actor: 'researcher',
+      actor: req.userContext?.userId || req.apiKeyContext?.id || 'researcher',
       action: 'STUDY_REGIONS_RESET',
       resourceType: 'study_region',
       resourceId: 'all',
@@ -177,9 +196,11 @@ scienceRouter.post(
   })
 );
 
-// 3. Live probe of NASA CMR Collections + all 12 Research Hub links
+// PROTECTED: Live probe of NASA CMR Collections + all 12 Research Hub links
 scienceRouter.post(
   '/probe-sources',
+  requireAuthenticated,
+  requireRoles('workspace_member', 'org_admin', 'platform_admin'),
   asyncHandler(async (_req: RequestWithContext, res) => {
     const regions = listStudyRegionsFromDb();
     const deltaRegion = regions.find((r) => r.id === 'nile-delta-north') || regions[0];
@@ -189,14 +210,16 @@ scienceRouter.post(
       probeAllResearchSources(),
     ]);
 
-    const updateResearch = db.prepare(`
-      UPDATE research_sources
-      SET integration_status = ?, last_probe_status = ?, last_probed_at = ?, probe_note = ?
-      WHERE id = ?
-    `);
-    for (const p of researchProbes) {
-      updateResearch.run(p.integrationStatus, p.httpStatus, p.checkedAt, p.note, p.id);
-    }
+    withTransaction(() => {
+      const updateResearch = db.prepare(`
+        UPDATE research_sources
+        SET integration_status = ?, last_probe_status = ?, last_probed_at = ?, probe_note = ?
+        WHERE id = ?
+      `);
+      for (const p of researchProbes) {
+        updateResearch.run(p.integrationStatus, p.httpStatus, p.checkedAt, p.note, p.id);
+      }
+    });
 
     res.json({
       probedAt: new Date().toISOString(),
@@ -206,9 +229,11 @@ scienceRouter.post(
   })
 );
 
-// 4. Execute modular scientific pipeline for one region + dataset
+// PROTECTED: Execute modular scientific pipeline for one region + dataset
 scienceRouter.post(
   '/pipeline/run',
+  requireAuthenticated,
+  requireRoles('workspace_member', 'org_admin', 'platform_admin'),
   asyncHandler(async (req: RequestWithContext, res) => {
     const {
       datasetId = 'merra-2',
@@ -227,15 +252,18 @@ scienceRouter.post(
       temporalAggregation: String(temporalAggregation) as TemporalAggregationMode,
       mode: String(mode) as ProvenanceMode,
       requestId: req.requestId,
+      persist: true,
     });
 
     res.json(result);
   })
 );
 
-// 5. Import real exported NASA Giovanni / AppEEARS CSV or JSON observations
+// PROTECTED: Import real exported NASA Giovanni / AppEEARS CSV or JSON observations
 scienceRouter.post(
   '/import',
+  requireAuthenticated,
+  requireRoles('workspace_member', 'org_admin', 'platform_admin'),
   asyncHandler(async (req: RequestWithContext, res) => {
     const {
       datasetId,
@@ -257,25 +285,34 @@ scienceRouter.post(
       );
     }
 
-    const result = await runScientificPipeline({
-      datasetId: String(datasetId) as ScientificDatasetSpec['id'],
-      regionId: String(regionId) as StudyRegionSpec['id'],
-      startDate: String(startDate),
-      endDate: String(endDate),
-      temporalAggregation: String(temporalAggregation) as TemporalAggregationMode,
-      mode: 'IMPORTED_OBSERVATIONS',
-      importedRawText: String(rawText),
-      importedFormat: format === 'json' ? 'json' : 'csv',
-      importedAlreadyNormalized: Boolean(alreadyNormalized),
-      importedSourceLabel: String(sourceLabel),
-      requestId: req.requestId,
-    });
-
-    res.status(201).json(result);
+    try {
+      const result = await runScientificPipeline({
+        datasetId: String(datasetId) as ScientificDatasetSpec['id'],
+        regionId: String(regionId) as StudyRegionSpec['id'],
+        startDate: String(startDate),
+        endDate: String(endDate),
+        temporalAggregation: String(temporalAggregation) as TemporalAggregationMode,
+        mode: 'IMPORTED_OBSERVATIONS',
+        importedRawText: String(rawText),
+        importedFormat: format === 'json' ? 'json' : 'csv',
+        importedAlreadyNormalized: Boolean(alreadyNormalized),
+        importedSourceLabel: String(sourceLabel),
+        requestId: req.requestId,
+        persist: true,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      throw new ApiError(
+        400,
+        'INVALID_OBSERVATION_IMPORT',
+        err instanceof Error ? err.message : 'Unable to validate imported observations.'
+      );
+    }
   })
 );
 
-// 6. Regional Comparison across Northern Nile Delta, Greater Cairo, and Upper Egypt
+// READ-ONLY / SCOPED: Regional Comparison across the 3 Egyptian study regions
+// Unauthenticated GET requests run strictly read-only (persist: false) so no DB mutations happen without auth
 scienceRouter.get(
   '/compare',
   asyncHandler(async (req: RequestWithContext, res) => {
@@ -284,6 +321,8 @@ scienceRouter.get(
     const endDate = String(req.query.endDate || '2024-12-31');
     const temporalAggregation = String(req.query.temporalAggregation || 'monthly') as TemporalAggregationMode;
     const mode = String(req.query.mode || 'LIVE_NASA_EARTHDATA') as ProvenanceMode;
+    const isAuthed = Boolean(req.userContext || req.apiKeyContext || req.adminSecretAuthenticated);
+    const persistFlag = isAuthed && req.query.persist === 'true';
 
     const comparison = await compareAllRegionsForDataset({
       datasetId,
@@ -292,14 +331,37 @@ scienceRouter.get(
       temporalAggregation,
       mode,
       requestId: req.requestId,
+      persist: persistFlag,
     });
 
     res.json(comparison);
   })
 );
 
-// 7. Query stored observations & run history
-scienceRouter.get('/runs', (_req, res) => {
-  const runs = db.prepare('SELECT * FROM pipeline_runs ORDER BY created_at DESC LIMIT 30').all();
-  res.json({ count: runs.length, runs });
-});
+// SCIENTIFIC GEOSPATIAL MODE: Exact EPSG:4326 bounding-box intersection & persisted observations lookup
+scienceRouter.get(
+  '/coordinate-profile',
+  asyncHandler((req: RequestWithContext, res) => {
+    const lat = Number(req.query.lat ?? 31.22);
+    const lon = Number(req.query.lon ?? 30.88);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+      throw new ApiError(400, 'INVALID_COORDINATES', 'Invalid WGS84 lat/lon coordinates.');
+    }
+    const datasetId = typeof req.query.datasetId === 'string' ? req.query.datasetId : undefined;
+    res.json(computeScientificCoordinateProfile(lat, lon, datasetId));
+  })
+);
+
+// PROTECTED: Query stored pipeline run history (paginated)
+scienceRouter.get(
+  '/runs',
+  requireAuthenticated,
+  requireRoles('authenticated_user', 'workspace_member', 'org_admin', 'platform_admin'),
+  asyncHandler((req: RequestWithContext, res) => {
+    const { limit, offset } = parsePagination(req.query, { limit: 30, maxLimit: 100 });
+    const runs = db
+      .prepare('SELECT * FROM pipeline_runs ORDER BY created_at DESC LIMIT ? OFFSET ?')
+      .all(limit, offset);
+    res.json({ count: runs.length, limit, offset, runs });
+  })
+);

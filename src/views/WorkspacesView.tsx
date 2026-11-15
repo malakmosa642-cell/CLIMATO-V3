@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { ArrowLeft, ArrowRight, MapPin, Plus } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { ArrowLeft, ArrowRight, KeyRound, MapPin, Plus } from 'lucide-react';
+import type { AuthOrgSummary, AuthUserSummary } from '../components/AuthModal';
 import DashboardShell from '../components/DashboardShell';
 import SampleDataBanner from '../components/SampleDataBanner';
 import { MODULES } from '../data/bilingualContent';
@@ -11,6 +12,10 @@ interface WorkspacesViewProps {
   aois: AoiLocation[];
   onNavigate: (route: PageRoute, opts?: { moduleId?: ModuleId; aoiId?: string }) => void;
   onRefresh?: () => void;
+  authUser?: AuthUserSummary | null;
+  authOrg?: AuthOrgSummary | null;
+  onOpenAuth?: () => void;
+  onLogout?: () => void;
 }
 
 export default function WorkspacesView({
@@ -19,28 +24,41 @@ export default function WorkspacesView({
   aois,
   onNavigate,
   onRefresh,
+  authUser,
+  authOrg,
+  onOpenAuth,
+  onLogout,
 }: WorkspacesViewProps) {
   const isAr = lang === 'ar';
   const ArrowIcon = isAr ? ArrowLeft : ArrowRight;
 
-  const [wsId, setWsId] = useState(workspaces[0]?.id || 'ws-delta-agro');
+  const [wsId, setWsId] = useState(workspaces[0]?.id || '');
   const [nameEn, setNameEn] = useState('');
   const [nameAr, setNameAr] = useState('');
   const [lat, setLat] = useState('31.42');
   const [lon, setLon] = useState('31.81');
   const [primaryModule, setPrimaryModule] = useState<ModuleId>('delta-risk');
   const [saving, setSaving] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (workspaces.length > 0 && !workspaces.some((w) => w.id === wsId)) {
+      setWsId(workspaces[0].id);
+    }
+  }, [workspaces, wsId]);
 
   const handleCreateAoi = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!nameEn.trim()) return;
     setSaving(true);
+    setErrorMsg(null);
     try {
       const res = await fetch('/api/aois', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
-          workspaceId: wsId || 'ws-delta-agro',
+          workspaceId: wsId || workspaces[0]?.id || undefined,
           nameEn: nameEn.trim(),
           nameAr: nameAr.trim() || nameEn.trim(),
           lat: Number(lat),
@@ -50,11 +68,21 @@ export default function WorkspacesView({
           primaryModule,
         }),
       });
-      if (res.ok) {
-        setNameEn('');
-        setNameAr('');
-        onRefresh?.();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(
+          data?.error?.message ||
+            (res.status === 401
+              ? isAr
+                ? 'يرجى تسجيل الدخول لإضافة منطقة اهتمام داخل مساحة العمل.'
+                : 'Sign in required to register custom AOI coordinates.'
+              : 'Unable to register AOI.')
+        );
+        return;
       }
+      setNameEn('');
+      setNameAr('');
+      onRefresh?.();
     } finally {
       setSaving(false);
     }
@@ -66,6 +94,10 @@ export default function WorkspacesView({
       route="workspaces"
       onNavigate={onNavigate}
       breadcrumb={isAr ? 'مساحات عمل العملاء والقطاعات' : 'Customer Workspaces'}
+      authUser={authUser}
+      authOrg={authOrg}
+      onOpenAuth={onOpenAuth}
+      onLogout={onLogout}
     >
       <div className="space-y-2">
         <h1 className="font-display text-2xl sm:text-3xl font-bold text-white">
@@ -80,6 +112,41 @@ export default function WorkspacesView({
 
       <SampleDataBanner lang={lang} />
 
+      {!authUser && workspaces.length === 0 && (
+        <div className="glass-panel rounded-2xl p-5 border border-[#22FF3A]/35 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs sm:text-sm text-slate-200">
+            {isAr
+              ? 'مساحات العمل المؤسسية محمية بعزل المستأجرين. سجل الدخول أو أنشئ مؤسسة للوصول إلى مساحات العمل وتسجيل مناطق الاهتمام.'
+              : 'Organization workspaces are tenant-isolated. Sign in or register an organization workspace to manage custom AOIs.'}
+          </p>
+          {onOpenAuth && (
+            <button
+              type="button"
+              onClick={onOpenAuth}
+              className="px-4 py-2 rounded-lg bg-[#22FF3A] text-[#020503] text-xs font-bold hover:bg-[#4DFF60] inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <KeyRound className="w-3.5 h-3.5" />
+              <span>{isAr ? 'تسجيل الدخول / إنشاء مؤسسة' : 'Sign In / Register'}</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {errorMsg && (
+        <div className="rounded-xl border border-rose-500/40 bg-rose-950/30 px-4 py-3 text-xs text-rose-200 flex flex-wrap items-center justify-between gap-3">
+          <span>{errorMsg}</span>
+          {!authUser && onOpenAuth && (
+            <button
+              type="button"
+              onClick={onOpenAuth}
+              className="px-3 py-1.5 rounded-lg bg-[#22FF3A] text-[#020503] text-xs font-bold hover:bg-[#4DFF60] cursor-pointer"
+            >
+              {isAr ? 'تسجيل الدخول' : 'Sign In'}
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Register Custom Egyptian AOI Form */}
       <form onSubmit={handleCreateAoi} className="glass-panel-elevated rounded-2xl p-5 space-y-4">
         <div className="flex items-center gap-2 text-xs font-semibold text-[#22FF3A]">
@@ -93,11 +160,15 @@ export default function WorkspacesView({
             onChange={(e) => setWsId(e.target.value)}
             className="bg-[#030A05] border border-emerald-900 rounded-lg px-3 py-2 text-xs text-white"
           >
-            {workspaces.map((ws) => (
-              <option key={ws.id} value={ws.id}>
-                {isAr ? ws.name_ar : ws.name_en}
-              </option>
-            ))}
+            {workspaces.length === 0 ? (
+              <option value="">{isAr ? 'اختر بعد تسجيل الدخول' : 'Sign in to select workspace'}</option>
+            ) : (
+              workspaces.map((ws) => (
+                <option key={ws.id} value={ws.id}>
+                  {isAr ? ws.name_ar : ws.name_en}
+                </option>
+              ))
+            )}
           </select>
 
           <input

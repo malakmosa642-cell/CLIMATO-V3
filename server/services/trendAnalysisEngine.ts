@@ -251,8 +251,8 @@ function runCoreMannKendallTheilSen(
   let ciUpper: number | null = null;
   if (N >= 3) {
     const cAlpha = 1.95996 * Math.sqrt(varS);
-    const m1 = Math.max(0, Math.floor((N - cAlpha) / 2));
-    const m2 = Math.min(N - 1, Math.ceil((N + cAlpha) / 2) - 1);
+    const m1 = Math.max(0, Math.min(N - 1, Math.floor((N - cAlpha) / 2)));
+    const m2 = Math.max(m1, Math.min(N - 1, Math.ceil((N + cAlpha) / 2) - 1));
     ciLower = Number(slopes[m1].toFixed(5));
     ciUpper = Number(slopes[m2].toFixed(5));
   }

@@ -11,12 +11,17 @@ import {
   Satellite,
   ShieldAlert,
 } from 'lucide-react';
+import type { AuthOrgSummary, AuthUserSummary } from '../components/AuthModal';
 import DashboardShell from '../components/DashboardShell';
 import { Language, PageRoute, ResearchSourceItem } from '../types/climate';
 
 interface ResearchHubViewProps {
   lang: Language;
   onNavigate: (route: PageRoute) => void;
+  authUser?: AuthUserSummary | null;
+  authOrg?: AuthOrgSummary | null;
+  onOpenAuth?: () => void;
+  onLogout?: () => void;
 }
 
 interface CmrProbeItem {
@@ -40,7 +45,14 @@ const CLASSIFICATIONS = [
   'Supporting satellite mission or documentation',
 ] as const;
 
-export default function ResearchHubView({ lang, onNavigate }: ResearchHubViewProps) {
+export default function ResearchHubView({
+  lang,
+  onNavigate,
+  authUser,
+  authOrg,
+  onOpenAuth,
+  onLogout,
+}: ResearchHubViewProps) {
   const isAr = lang === 'ar';
   const [sources, setSources] = useState<ResearchSourceItem[]>([]);
   const [activeFilter, setActiveFilter] = useState<(typeof CLASSIFICATIONS)[number]>('ALL');
@@ -70,8 +82,11 @@ export default function ResearchHubView({ lang, onNavigate }: ResearchHubViewPro
     setProbing(true);
     setErrorMsg(null);
     try {
-      const res = await fetch('/api/science/probe-sources', { method: 'POST' });
-      const data = await res.json();
+      const res = await fetch('/api/science/probe-sources', {
+        method: 'POST',
+        credentials: 'include',
+      });
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error?.message || 'Probe failed');
       setCmrProbes(data.cmrProbes || []);
       setLastProbeTime(data.probedAt || new Date().toISOString());
@@ -149,6 +164,10 @@ export default function ResearchHubView({ lang, onNavigate }: ResearchHubViewPro
       route="research"
       onNavigate={onNavigate}
       breadcrumb={isAr ? 'مركز البيانات والأبحاث العلمية' : 'Data Sources & Research Hub'}
+      authUser={authUser}
+      authOrg={authOrg}
+      onOpenAuth={onOpenAuth}
+      onLogout={onLogout}
     >
       <div className="space-y-6">
         {/* Header */}
@@ -225,8 +244,17 @@ export default function ResearchHubView({ lang, onNavigate }: ResearchHubViewPro
           </div>
 
           {errorMsg && (
-            <div className="rounded-lg border border-rose-500/40 bg-rose-950/30 px-3 py-2 text-xs text-rose-200">
-              {errorMsg}
+            <div className="rounded-lg border border-rose-500/40 bg-rose-950/30 px-3 py-2 text-xs text-rose-200 flex flex-wrap items-center justify-between gap-2">
+              <span>{errorMsg}</span>
+              {!authUser && onOpenAuth && (
+                <button
+                  type="button"
+                  onClick={onOpenAuth}
+                  className="px-2.5 py-1 rounded bg-[#22FF3A] text-[#020503] font-bold hover:bg-[#4DFF60] cursor-pointer"
+                >
+                  {isAr ? 'تسجيل الدخول' : 'Sign In'}
+                </button>
+              )}
             </div>
           )}
         </div>
