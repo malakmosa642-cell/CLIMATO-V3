@@ -1,0 +1,8 @@
+{
+  "name": "CLIMATO",
+  "description": "CLIMATO — Bilingual Arabic and English geospatial climate intelligence platform focused on Egypt, the Nile Delta, and enterprise climate risk.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
